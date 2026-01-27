@@ -1,4 +1,4 @@
-// X1 Encrypted Messaging Server - Secure Version with Key Verification
+// X1 Encrypted Messaging Server - Secure Version with SSE
 import express from 'express';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
@@ -11,6 +11,7 @@ const PORT = process.env.PORT || 3001;
 // In-memory storage
 const keyRegistry = new Map();    // address -> x25519PublicKey
 const messageStore = new Map();   // recipient -> messages[]
+const sseClients = new Map();     // address -> Set of response objects
 
 // Base58 decode for verification
 const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
@@ -72,48 +73,85 @@ app.post('/api/keys', (req, res) => {
     }
 
     try {
-        // Decode address (which is the ed25519 public key)
         const walletPubKey = base58Decode(address);
         if (walletPubKey.length !== 32) {
             return res.status(400).json({ error: 'Invalid address length' });
         }
 
-        // Decode signature
         const signatureBytes = base58Decode(signature);
         if (signatureBytes.length !== 64) {
             return res.status(400).json({ error: 'Invalid signature length' });
         }
 
-        // The signed message is human-readable: "X1 Messaging: Register encryption key <key>"
         const messageText = `X1 Messaging: Register encryption key ${x25519PublicKey}`;
         const messageBytes = new TextEncoder().encode(messageText);
 
-        // Verify signature
         const isValid = ed25519.verify(signatureBytes, messageBytes, walletPubKey);
 
         if (!isValid) {
-            console.log(`[Keys] REJECTED: Invalid signature for ${address.slice(0, 8)}...`);
-            return res.status(401).json({ error: 'Invalid signature - you must prove ownership of this address' });
+            console.log(`[Keys] REJECTED: ${address.slice(0, 8)}...`);
+            return res.status(401).json({ error: 'Invalid signature' });
         }
 
-        // Signature valid - store the key
         keyRegistry.set(address, x25519PublicKey);
-        console.log(`[Keys] VERIFIED & Registered: ${address.slice(0, 8)}...`);
+        console.log(`[Keys] Registered: ${address.slice(0, 8)}...`);
         res.json({ success: true });
 
     } catch (e) {
         console.error('[Keys] Error:', e.message);
-        res.status(400).json({ error: 'Verification failed: ' + e.message });
+        res.status(400).json({ error: 'Verification failed' });
     }
 });
 
-// Lookup X25519 public key
 app.get('/api/keys/:address', (req, res) => {
     const key = keyRegistry.get(req.params.address);
     if (!key) {
         return res.status(404).json({ error: 'Not found' });
     }
     res.json({ address: req.params.address, x25519PublicKey: key });
+});
+
+// ============================================================================
+// SSE - Server-Sent Events for real-time messages
+// ============================================================================
+
+app.get('/api/stream/:address', (req, res) => {
+    const address = req.params.address;
+
+    // Set SSE headers
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.flushHeaders();
+
+    // Send initial connection message
+    res.write(`data: ${JSON.stringify({ type: 'connected' })}\n\n`);
+
+    // Register this client
+    if (!sseClients.has(address)) {
+        sseClients.set(address, new Set());
+    }
+    sseClients.get(address).add(res);
+    console.log(`[SSE] Connected: ${address.slice(0, 8)}... (${sseClients.get(address).size} clients)`);
+
+    // Send any pending messages
+    const pending = messageStore.get(address) || [];
+    for (const msg of pending) {
+        res.write(`data: ${JSON.stringify({ type: 'message', message: msg })}\n\n`);
+    }
+
+    // Heartbeat to keep connection alive
+    const heartbeat = setInterval(() => {
+        res.write(`data: ${JSON.stringify({ type: 'ping' })}\n\n`);
+    }, 30000);
+
+    // Cleanup on disconnect
+    req.on('close', () => {
+        clearInterval(heartbeat);
+        sseClients.get(address)?.delete(res);
+        console.log(`[SSE] Disconnected: ${address.slice(0, 8)}...`);
+    });
 });
 
 // ============================================================================
@@ -132,12 +170,24 @@ app.post('/api/messages', (req, res) => {
         timestamp: Date.now()
     };
 
+    // Store message
     if (!messageStore.has(to)) {
         messageStore.set(to, []);
     }
     messageStore.get(to).push(message);
 
-    console.log(`[Msg] ${from.slice(0, 8)}... -> ${to.slice(0, 8)}...`);
+    // Push to connected SSE clients
+    const clients = sseClients.get(to);
+    if (clients && clients.size > 0) {
+        const data = JSON.stringify({ type: 'message', message });
+        for (const client of clients) {
+            client.write(`data: ${data}\n\n`);
+        }
+        console.log(`[Msg] ${from.slice(0, 8)}... -> ${to.slice(0, 8)}... (pushed to ${clients.size} clients)`);
+    } else {
+        console.log(`[Msg] ${from.slice(0, 8)}... -> ${to.slice(0, 8)}... (stored, recipient offline)`);
+    }
+
     res.json({ success: true, id: message.id });
 });
 
@@ -153,13 +203,13 @@ app.get('/api/messages/:address', (req, res) => {
 // ============================================================================
 
 app.listen(PORT, () => {
-    console.log(`\nX1 Encrypted Messaging Server (Secure + Verified Keys)`);
-    console.log(`=======================================================`);
+    console.log(`\nX1 Encrypted Messaging Server (SSE)`);
+    console.log(`====================================`);
     console.log(`http://localhost:${PORT}`);
-    console.log(`\nKey Registration: Requires signature proof of ownership`);
-    console.log(`Endpoints:`);
-    console.log(`  POST /api/keys     - Register key (with signature)`);
-    console.log(`  GET  /api/keys/:a  - Lookup public key`);
-    console.log(`  POST /api/messages - Send message`);
+    console.log(`\nEndpoints:`);
+    console.log(`  POST /api/keys        - Register key (with signature)`);
+    console.log(`  GET  /api/keys/:a     - Lookup public key`);
+    console.log(`  GET  /api/stream/:a   - SSE stream for real-time messages`);
+    console.log(`  POST /api/messages    - Send message`);
     console.log(`  GET  /api/messages/:a - Get messages\n`);
 });

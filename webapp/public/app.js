@@ -14,7 +14,7 @@ import { randomBytes } from '@noble/ciphers/webcrypto';
 const DOMAIN_SEPARATOR = 'x1-msg-v1';
 const SIGN_MESSAGE = 'X1 Encrypted Messaging - Sign to generate your encryption keys';
 const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
-const POLL_INTERVAL = 5000;
+// SSE connection (replaces polling)
 
 // Detect base path from URL
 const API_BASE = (() => {
@@ -36,7 +36,7 @@ const state = {
     messages: [],
     lastSender: null,
     lastFetchTime: 0,
-    pollTimer: null,
+    sseConnection: null,     // EventSource for real-time messages
     seenMessageIds: new Set(),
 };
 
@@ -284,15 +284,67 @@ async function checkForNewMessages() {
     }
 }
 
-function startPolling() {
-    if (state.pollTimer) return;
-    state.pollTimer = setInterval(checkForNewMessages, POLL_INTERVAL);
+function connectSSE() {
+    if (state.sseConnection) return;
+    if (!state.wallet) return;
+
+    const url = `${API_BASE}/api/stream/${encodeURIComponent(state.wallet)}`;
+    console.log('[SSE] Connecting to:', url);
+
+    const eventSource = new EventSource(url);
+
+    eventSource.onopen = () => {
+        console.log('[SSE] Connection opened');
+    };
+
+    eventSource.onmessage = async (event) => {
+        try {
+            const data = JSON.parse(event.data);
+
+            if (data.type === 'connected') {
+                console.log('[SSE] Connected to server');
+                updateConnectionStatus(true);
+            } else if (data.type === 'ping') {
+                // Heartbeat, ignore
+            } else if (data.type === 'message') {
+                // New message received
+                const decrypted = await processIncomingMessage(data.message);
+                if (decrypted) {
+                    state.messages.push(decrypted);
+                    state.lastSender = decrypted.from;
+                    state.lastFetchTime = Math.max(state.lastFetchTime, data.message.timestamp);
+                    updateUI();
+                    showToast('New message received!', 'success');
+                }
+            }
+        } catch (e) {
+            console.error('[SSE] Parse error:', e);
+        }
+    };
+
+    eventSource.onerror = (error) => {
+        console.error('[SSE] Error:', error);
+        updateConnectionStatus(false);
+        // EventSource will auto-reconnect
+    };
+
+    state.sseConnection = eventSource;
 }
 
-function stopPolling() {
-    if (state.pollTimer) {
-        clearInterval(state.pollTimer);
-        state.pollTimer = null;
+function disconnectSSE() {
+    if (state.sseConnection) {
+        state.sseConnection.close();
+        state.sseConnection = null;
+        console.log('[SSE] Disconnected');
+    }
+}
+
+function updateConnectionStatus(online) {
+    const connectionStatus = document.getElementById('connectionStatus');
+    if (online) {
+        connectionStatus.innerHTML = '<span class="status-dot online"></span><span>Live</span>';
+    } else {
+        connectionStatus.innerHTML = '<span class="status-dot offline"></span><span>Reconnecting...</span>';
     }
 }
 
@@ -337,7 +389,14 @@ function updateUI() {
         walletConnected.classList.remove('hidden');
         walletAddress.textContent = shortenAddress(state.wallet);
         myAddress.textContent = shortenAddress(state.wallet);
-        connectionStatus.innerHTML = '<span class="status-dot online"></span><span>Connected</span>';
+        // SSE connection status is updated separately via updateConnectionStatus()
+        if (state.sseConnection && state.sseConnection.readyState === EventSource.OPEN) {
+            connectionStatus.innerHTML = '<span class="status-dot online"></span><span>Live</span>';
+        } else if (state.sseConnection) {
+            connectionStatus.innerHTML = '<span class="status-dot offline"></span><span>Connecting...</span>';
+        } else {
+            connectionStatus.innerHTML = '<span class="status-dot online"></span><span>Connected</span>';
+        }
         sendBtn.disabled = false;
     } else {
         walletDisconnected.classList.remove('hidden');
@@ -385,7 +444,8 @@ function updateMessagesList() {
         const time = new Date(msg.timestamp).toLocaleTimeString();
         const dir = msg.direction;
         const other = dir === 'sent' ? msg.to : msg.from;
-        html += `<div class="message-item ${dir}">
+        const clickable = dir === 'received' ? `onclick="replyTo('${other}')" style="cursor:pointer;" title="Click to reply"` : '';
+        html += `<div class="message-item ${dir}" ${clickable}>
             <div class="message-header">
                 <span class="message-direction">${dir}</span>
                 <span class="message-time">${time}</span>
@@ -417,6 +477,9 @@ window.connectWallet = async function() {
         const walletAddress = resp.publicKey.toString();
         state.wallet = walletAddress;
         state.walletProvider = provider;
+
+        // Save wallet address for auto-reconnect
+        localStorage.setItem('x1msg-wallet', walletAddress);
 
         // Check for cached signature
         const cacheKey = `x1msg-sig-${walletAddress}`;
@@ -453,9 +516,8 @@ window.connectWallet = async function() {
         updateUI();
         showToast('Connected!', 'success');
 
-        // Fetch messages
-        await checkForNewMessages();
-        startPolling();
+        // Connect to SSE for real-time messages
+        connectSSE();
 
         console.log('Connected:', walletAddress);
 
@@ -466,7 +528,9 @@ window.connectWallet = async function() {
 };
 
 window.disconnectWallet = function() {
-    stopPolling();
+    disconnectSSE();
+    // Clear cached wallet (but keep signature for faster reconnect if they connect again)
+    localStorage.removeItem('x1msg-wallet');
     state.wallet = null;
     state.walletProvider = null;
     state.privateKey = null;
@@ -493,6 +557,12 @@ window.swapAddresses = function() {
         document.getElementById('recipientAddress').value = state.lastSender;
         showToast('Swapped to last sender', 'info');
     }
+};
+
+window.replyTo = function(address) {
+    document.getElementById('recipientAddress').value = address;
+    document.getElementById('messageContent').focus();
+    showToast('Replying to ' + shortenAddress(address), 'info');
 };
 
 // ============================================================================
@@ -568,9 +638,62 @@ window.refreshMessages = async function() {
 // INIT
 // ============================================================================
 
+async function tryAutoReconnect() {
+    // Check for cached wallet and signature
+    const cachedWallet = localStorage.getItem('x1msg-wallet');
+    if (!cachedWallet) return;
+
+    const cacheKey = `x1msg-sig-${cachedWallet}`;
+    const cachedSig = localStorage.getItem(cacheKey);
+    if (!cachedSig) return;
+
+    try {
+        // Restore keys from cached signature (no wallet interaction needed)
+        const signatureBytes = base58Decode(cachedSig);
+        const keyPair = deriveX25519KeyPair(signatureBytes);
+
+        // Verify our key is still registered on server
+        const serverKey = await lookupPublicKey(cachedWallet);
+        if (!serverKey) {
+            console.log('[Auto] Key not on server, need full reconnect');
+            localStorage.removeItem('x1msg-wallet');
+            return;
+        }
+
+        // Verify it matches our derived key
+        const ourKeyB58 = base58Encode(keyPair.publicKey);
+        const serverKeyB58 = base58Encode(serverKey);
+        if (ourKeyB58 !== serverKeyB58) {
+            console.log('[Auto] Key mismatch, need full reconnect');
+            localStorage.removeItem('x1msg-wallet');
+            return;
+        }
+
+        // Restore state
+        state.wallet = cachedWallet;
+        state.privateKey = keyPair.privateKey;
+        state.publicKey = keyPair.publicKey;
+
+        // Find wallet provider (for sending, but don't connect yet)
+        state.walletProvider = window.x1_wallet || window.x1Wallet || window.backpack ||
+                               window.phantom?.solana || window.solana;
+
+        updateUI();
+        connectSSE();
+        console.log('[Auto] Restored session:', cachedWallet);
+
+    } catch (e) {
+        console.log('[Auto] Restore failed:', e.message);
+        localStorage.removeItem('x1msg-wallet');
+    }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     updateUI();
     console.log('X1 Encrypted Messaging (Secure Version)');
+
+    // Try auto-reconnect after a short delay (let wallet extension load)
+    setTimeout(tryAutoReconnect, 500);
 });
 
 // Debug exports
