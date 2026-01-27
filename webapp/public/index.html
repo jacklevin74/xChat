@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>X1 Encrypted Messaging</title>
+    <link rel="stylesheet" href="styles.css">
+    <script type="importmap">
+    {
+        "imports": {
+            "@noble/curves/ed25519": "https://esm.run/@noble/curves@1.4.0/ed25519",
+            "@noble/hashes/hkdf": "https://esm.run/@noble/hashes@1.4.0/hkdf",
+            "@noble/hashes/sha256": "https://esm.run/@noble/hashes@1.4.0/sha256",
+            "@noble/ciphers/aes": "https://esm.run/@noble/ciphers@0.5.3/aes",
+            "@noble/ciphers/webcrypto": "https://esm.run/@noble/ciphers@0.5.3/webcrypto"
+        }
+    }
+    </script>
+</head>
+<body>
+    <!-- Toast Notifications Container -->
+    <div id="toastContainer"></div>
+
+    <div class="app-container">
+        <!-- Header -->
+        <header class="unified-header">
+            <div class="header-row-top">
+                <div class="brand">X1 <span class="brand-subtitle">Encrypted Messaging</span></div>
+                <div class="wallet-section">
+                    <div id="walletDisconnected">
+                        <button class="btn-wallet" onclick="connectWallet()">Connect Wallet</button>
+                    </div>
+                    <div id="walletConnected" class="hidden">
+                        <div class="wallet-info">
+                            <span class="wallet-address" id="walletAddress">-</span>
+                            <button class="btn-disconnect" onclick="disconnectWallet()">Disconnect</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="header-row-bottom">
+                <div class="header-stat">
+                    <span class="stat-label">Your Address (click to copy)</span>
+                    <span class="stat-value" id="myAddress" style="cursor: pointer;" onclick="copyAddress()" title="Click to copy">Not connected</span>
+                </div>
+                <div class="header-stat" style="display:none;">
+                    <span class="stat-value" id="myX25519">-</span>
+                </div>
+                <div class="header-stat">
+                    <span class="stat-label">Status</span>
+                    <span class="stat-value" id="connectionStatus">
+                        <span class="status-dot offline"></span>
+                        <span>Offline</span>
+                    </span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <div class="main-grid">
+            <!-- Left Panel: Messages -->
+            <div class="messages-panel">
+                <div class="panel-header">
+                    <h3>Messages</h3>
+                    <button class="btn-refresh" onclick="refreshMessages()">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/>
+                        </svg>
+                    </button>
+                </div>
+                <div class="messages-list" id="messagesList">
+                    <div class="empty-state">
+                        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                            <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/>
+                        </svg>
+                        <p>No messages yet</p>
+                        <span>Connect your wallet and start messaging</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Panel: Compose -->
+            <div class="compose-panel">
+                <div class="panel-header">
+                    <h3>Send Encrypted Message</h3>
+                </div>
+                <div class="compose-form">
+                    <!-- Send Message -->
+                    <div class="form-section">
+                        <label class="form-label">Recipient Address</label>
+                        <div class="input-group">
+                            <input type="text"
+                                   id="recipientAddress"
+                                   class="form-input"
+                                   placeholder="Select from peers or paste address">
+                            <button class="btn-icon" onclick="swapAddresses()" title="Use last sender's address">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M7 16V4M7 4L3 8M7 4l4 4M17 8v12m0 0l4-4m-4 4l-4-4"/>
+                                </svg>
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="form-section">
+                        <label class="form-label">Message</label>
+                        <textarea id="messageContent"
+                                  class="form-textarea"
+                                  placeholder="Type your encrypted message..."
+                                  rows="4"></textarea>
+                    </div>
+
+                    <div class="form-section">
+                        <button class="btn-primary" onclick="sendMessage()" id="sendBtn" disabled>
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/>
+                            </svg>
+                            <span>Send Encrypted Message</span>
+                        </button>
+                    </div>
+
+                    <!-- Recent Contacts -->
+                    <div class="form-section">
+                        <label class="form-label">Recent Contacts</label>
+                        <div class="peers-list" id="peersList">
+                            <div class="empty-peers">No contacts yet</div>
+                        </div>
+                    </div>
+
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script type="module" src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,32 @@
+{
+  "name": "x1-encrypted-memo",
+  "version": "0.1.0",
+  "description": "X1 E2E Encrypted Messaging Protocol - Wallet-to-wallet encrypted messaging",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "demo": "tsx examples/demo.ts",
+    "webapp": "node webapp/server.js"
+  },
+  "dependencies": {
+    "@noble/curves": "^1.4.0",
+    "@noble/hashes": "^1.4.0",
+    "@noble/ciphers": "^0.5.0",
+    "better-sqlite3": "^11.0.0",
+    "express": "^4.18.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0",
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^20.0.0",
+    "tsx": "^4.7.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
