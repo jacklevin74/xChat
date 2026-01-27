@@ -634,6 +634,56 @@ window.refreshMessages = async function() {
     await checkForNewMessages();
 };
 
+window.clearMessages = async function() {
+    if (!state.wallet || !state.walletProvider) {
+        // Just clear locally if not connected
+        state.messages = [];
+        state.seenMessageIds.clear();
+        updateUI();
+        showToast('Local messages cleared', 'info');
+        return;
+    }
+
+    try {
+        // Sign deletion request
+        const messageText = `X1 Messaging: Delete my message history`;
+        const messageBytes = new TextEncoder().encode(messageText);
+
+        showToast('Sign to delete message history...', 'info');
+        const { signature } = await state.walletProvider.signMessage(messageBytes, 'utf8');
+        const signatureB58 = base58Encode(signature);
+
+        // Call server to delete
+        const res = await fetch(`${API_BASE}/api/messages/${encodeURIComponent(state.wallet)}`, {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ signature: signatureB58 })
+        });
+
+        if (!res.ok) {
+            const err = await res.json();
+            showToast('Delete failed: ' + err.error, 'error');
+            return;
+        }
+
+        const data = await res.json();
+
+        // Clear local state
+        state.messages = [];
+        state.seenMessageIds.clear();
+        updateUI();
+        showToast(`Deleted ${data.deleted} messages from server`, 'success');
+
+    } catch (e) {
+        console.error('Delete failed:', e);
+        if (e.message?.includes('User rejected')) {
+            showToast('Deletion cancelled', 'info');
+        } else {
+            showToast('Delete failed: ' + e.message, 'error');
+        }
+    }
+};
+
 // ============================================================================
 // INIT
 // ============================================================================

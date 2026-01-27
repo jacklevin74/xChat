@@ -198,6 +198,60 @@ app.get('/api/messages/:address', (req, res) => {
     res.json({ messages });
 });
 
+// Delete message history - requires signature proof
+app.delete('/api/messages/:address', (req, res) => {
+    const address = req.params.address;
+    const { signature } = req.body;
+
+    if (!signature) {
+        return res.status(400).json({ error: 'Missing signature' });
+    }
+
+    try {
+        const walletPubKey = base58Decode(address);
+        if (walletPubKey.length !== 32) {
+            return res.status(400).json({ error: 'Invalid address' });
+        }
+
+        const signatureBytes = base58Decode(signature);
+        if (signatureBytes.length !== 64) {
+            return res.status(400).json({ error: 'Invalid signature' });
+        }
+
+        // Verify signature on deletion request
+        const messageText = `X1 Messaging: Delete my message history`;
+        const messageBytes = new TextEncoder().encode(messageText);
+        const isValid = ed25519.verify(signatureBytes, messageBytes, walletPubKey);
+
+        if (!isValid) {
+            return res.status(401).json({ error: 'Invalid signature' });
+        }
+
+        // Delete messages where this address is sender OR recipient
+        let deletedCount = 0;
+
+        for (const [recipient, messages] of messageStore.entries()) {
+            const before = messages.length;
+            const filtered = messages.filter(m => m.from !== address && m.to !== address);
+            if (filtered.length < before) {
+                deletedCount += before - filtered.length;
+                if (filtered.length === 0) {
+                    messageStore.delete(recipient);
+                } else {
+                    messageStore.set(recipient, filtered);
+                }
+            }
+        }
+
+        console.log(`[Msg] Deleted ${deletedCount} messages for ${address.slice(0, 8)}...`);
+        res.json({ success: true, deleted: deletedCount });
+
+    } catch (e) {
+        console.error('[Msg] Delete error:', e.message);
+        res.status(400).json({ error: 'Delete failed' });
+    }
+});
+
 // ============================================================================
 // START
 // ============================================================================
