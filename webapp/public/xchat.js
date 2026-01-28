@@ -38,7 +38,69 @@ const state = {
     historyLoaded: false,     // Track if initial history has loaded
     pendingContacts: new Map(), // address -> Promise (prevent race conditions)
     lastSyncTimestamp: 0,     // Track last synced message timestamp for incremental sync
+    readMessageIds: new Set(), // Track which messages have been read (persisted to localStorage)
 };
+
+// ============================================================================
+// READ MESSAGE TRACKING (localStorage persistence)
+// ============================================================================
+
+function getReadMessagesKey() {
+    return state.wallet ? `xchat_read_${state.wallet}` : null;
+}
+
+function loadReadMessages() {
+    const key = getReadMessagesKey();
+    if (!key) return;
+
+    try {
+        const stored = localStorage.getItem(key);
+        if (stored) {
+            const ids = JSON.parse(stored);
+            state.readMessageIds = new Set(ids);
+            console.log(`[Read] Loaded ${state.readMessageIds.size} read message IDs`);
+        }
+    } catch (e) {
+        console.error('[Read] Failed to load read messages:', e);
+        state.readMessageIds = new Set();
+    }
+}
+
+function saveReadMessages() {
+    const key = getReadMessagesKey();
+    if (!key) return;
+
+    try {
+        // Keep only the last 10000 message IDs to prevent unbounded growth
+        const ids = [...state.readMessageIds].slice(-10000);
+        localStorage.setItem(key, JSON.stringify(ids));
+    } catch (e) {
+        console.error('[Read] Failed to save read messages:', e);
+    }
+}
+
+function markMessageAsRead(messageId) {
+    if (!messageId) return;
+    state.readMessageIds.add(messageId);
+}
+
+function markChatMessagesAsRead(contactAddress) {
+    const messages = state.messages.get(contactAddress) || [];
+    let marked = 0;
+    for (const msg of messages) {
+        if (msg.id && !state.readMessageIds.has(msg.id)) {
+            state.readMessageIds.add(msg.id);
+            marked++;
+        }
+    }
+    if (marked > 0) {
+        saveReadMessages();
+    }
+}
+
+function isMessageRead(messageId) {
+    return state.readMessageIds.has(messageId);
+}
 
 // ============================================================================
 // BASE58 ENCODING
@@ -140,10 +202,25 @@ function decrypt(key, nonce, ciphertext) {
 // ============================================================================
 
 async function registerPublicKey(address, publicKey, provider) {
+    const publicKeyB58 = base58Encode(publicKey);
+
+    // First check if key is already registered
     try {
-        const publicKeyB58 = base58Encode(publicKey);
+        const existingKey = await lookupPublicKey(address);
+        if (existingKey && base58Encode(existingKey) === publicKeyB58) {
+            console.log('[Register] Key already registered');
+            return true;
+        }
+    } catch (e) {
+        // Continue to registration
+    }
+
+    // Need to register - requires signature
+    try {
         const messageText = `X1 Messaging: Register encryption key ${publicKeyB58}`;
         const messageBytes = new TextEncoder().encode(messageText);
+
+        console.log('[Register] Requesting signature for key registration...');
         const { signature } = await provider.signMessage(messageBytes, 'utf8');
         const signatureB58 = base58Encode(signature);
 
@@ -154,7 +231,15 @@ async function registerPublicKey(address, publicKey, provider) {
         });
         return res.ok;
     } catch (e) {
-        console.error('Register key failed:', e);
+        // Check if user rejected
+        const isUserRejection = e.message?.includes('User rejected') ||
+                                e.message?.includes('user rejected') ||
+                                e.code === 4001;
+        if (isUserRejection) {
+            console.log('[Register] User cancelled signature');
+        } else {
+            console.error('[Register] Failed:', e);
+        }
         return false;
     }
 }
@@ -309,11 +394,26 @@ function connectSSE() {
 
             if (data.type === 'connected') {
                 updateConnectionStatus(true);
-                console.log(`[SSE] Connected, syncing ${data.messageCount} messages since ${data.since}`);
+                console.log(`[SSE] Connected, syncing ${data.messageCount ?? '?'} messages since ${data.since ?? 0}`);
+
+                // For backward compatibility: if server doesn't send history_complete,
+                // mark history as loaded after a delay
+                if (data.messageCount === undefined) {
+                    setTimeout(() => {
+                        if (!state.historyLoaded) {
+                            state.historyLoaded = true;
+                            console.log('[SSE] History loaded (legacy mode). Contacts:', state.contacts.size);
+                            saveReadMessages();
+                            updateContactsList();
+                            renderMessages();
+                        }
+                    }, 1500);
+                }
             } else if (data.type === 'history_complete') {
                 // History sync is complete, now safe to update UI
                 state.historyLoaded = true;
                 console.log('[SSE] History sync complete. Contacts:', state.contacts.size, 'Messages:', [...state.messages.values()].reduce((a, b) => a + b.length, 0));
+                saveReadMessages(); // Persist any newly read messages (e.g., sent messages)
                 updateContactsList();
                 renderMessages();
             } else if (data.type === 'ping') {
@@ -332,9 +432,18 @@ function connectSSE() {
                     const contact = state.contacts.get(decrypted.contactAddress);
                     if (contact) {
                         contact.lastMessage = decrypted;
-                        // Only increment unread for received messages not in active chat
-                        if (decrypted.direction === 'received' && state.activeChat !== decrypted.contactAddress) {
+                        // Only increment unread for received messages not in active chat and not already read
+                        if (decrypted.direction === 'received' &&
+                            state.activeChat !== decrypted.contactAddress &&
+                            !isMessageRead(decrypted.id)) {
                             contact.unread++;
+                        }
+                        // Mark as read if in active chat or if sent by us
+                        if (state.activeChat === decrypted.contactAddress || decrypted.direction === 'sent') {
+                            markMessageAsRead(decrypted.id);
+                            if (state.historyLoaded) {
+                                saveReadMessages(); // Save immediately for real-time messages
+                            }
                         }
                     }
 
@@ -568,11 +677,12 @@ window.selectChat = function(address) {
     try {
         state.activeChat = address;
 
-        // Clear unread
+        // Clear unread and mark messages as read
         const contact = state.contacts.get(address);
         if (contact) {
             contact.unread = 0;
         }
+        markChatMessagesAsRead(address);
 
         // Update UI - ensure elements exist
         const noChat = document.getElementById('noChat');
@@ -750,19 +860,31 @@ document.addEventListener('DOMContentLoaded', () => {
 
 window.connectWallet = async function() {
     try {
+        // Wait a moment for wallet extensions to fully initialize
+        await new Promise(r => setTimeout(r, 100));
+
         let provider = window.x1_wallet || window.x1Wallet || window.backpack ||
                        window.phantom?.solana || window.solana;
 
         if (!provider) {
-            showToast('No wallet found', 'error');
+            showToast('No wallet found. Please install X1 Wallet.', 'error');
             return;
         }
 
-        const resp = await provider.connect();
-        const walletAddress = resp.publicKey.toString();
+        // Check if already connected (some wallets auto-connect)
+        let walletAddress;
+        if (provider.publicKey) {
+            walletAddress = provider.publicKey.toString();
+            console.log('[Connect] Wallet already connected:', walletAddress.slice(0, 8));
+        } else {
+            console.log('[Connect] Requesting wallet connection...');
+            const resp = await provider.connect();
+            walletAddress = resp.publicKey.toString();
+        }
         state.wallet = walletAddress;
         state.walletProvider = provider;
         localStorage.setItem('x1msg-wallet', walletAddress);
+        loadReadMessages();
 
         // Check for cached signature
         const cacheKey = `x1msg-sig-${walletAddress}`;
@@ -786,7 +908,14 @@ window.connectWallet = async function() {
         showToast('Registering encryption key...', 'info');
         const registered = await registerPublicKey(walletAddress, keyPair.publicKey, provider);
         if (!registered) {
-            showToast('Failed to register key', 'error');
+            // Clean up partial state
+            state.wallet = null;
+            state.walletProvider = null;
+            state.privateKey = null;
+            state.publicKey = null;
+            localStorage.removeItem('x1msg-wallet');
+            localStorage.removeItem(cacheKey);
+            // Don't show error toast - registerPublicKey handles it for user rejection
             return;
         }
 
@@ -796,8 +925,24 @@ window.connectWallet = async function() {
         showToast('Connected!', 'success');
 
     } catch (e) {
-        console.error('Connect failed:', e);
-        showToast('Connection failed', 'error');
+        // Check if user rejected/cancelled the request
+        const isUserRejection = e.message?.includes('User rejected') ||
+                                e.message?.includes('User cancelled') ||
+                                e.message?.includes('user rejected') ||
+                                e.code === 4001; // Standard wallet rejection code
+
+        if (isUserRejection) {
+            console.log('[Connect] User cancelled');
+            // Clean up partial state if wallet was set
+            if (state.wallet && !state.privateKey) {
+                state.wallet = null;
+                state.walletProvider = null;
+                localStorage.removeItem('x1msg-wallet');
+            }
+        } else {
+            console.error('Connect failed:', e);
+            showToast('Connection failed', 'error');
+        }
     }
 };
 
@@ -816,6 +961,7 @@ window.disconnectWallet = function() {
     state.seenMessageIds.clear();
     state.historyLoaded = false;
     state.pendingContacts.clear();
+    state.readMessageIds.clear();
 
     // Clear localStorage
     const cachedWallet = localStorage.getItem('x1msg-wallet');
@@ -869,6 +1015,7 @@ async function tryAutoReconnect() {
         state.publicKey = keyPair.publicKey;
         state.walletProvider = window.x1_wallet || window.x1Wallet || window.backpack ||
                                window.phantom?.solana || window.solana;
+        loadReadMessages();
 
         document.getElementById('connectOverlay').classList.add('hidden');
         document.getElementById('disconnectBtn')?.classList.remove('hidden');
