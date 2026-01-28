@@ -1,16 +1,54 @@
-// X1 Encrypted Messaging Server - Secure Version with SSE
+// X1 Encrypted Messaging Server - Secure Version with SSE + SQLite
 import express from 'express';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { ed25519 } from '@noble/curves/ed25519';
+import Database from 'better-sqlite3';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// In-memory storage
-const keyRegistry = new Map();    // address -> x25519PublicKey
-const messageStore = new Map();   // recipient -> messages[]
+// SQLite database
+const db = new Database(join(__dirname, 'data', 'messages.db'));
+db.pragma('journal_mode = WAL');
+
+// Create tables
+db.exec(`
+    CREATE TABLE IF NOT EXISTS keys (
+        address TEXT PRIMARY KEY,
+        x25519_public_key TEXT NOT NULL,
+        created_at INTEGER DEFAULT (strftime('%s', 'now') * 1000)
+    );
+
+    CREATE TABLE IF NOT EXISTS messages (
+        id TEXT PRIMARY KEY,
+        sender TEXT NOT NULL,
+        recipient TEXT NOT NULL,
+        nonce TEXT NOT NULL,
+        ciphertext TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient, created_at);
+    CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender);
+`);
+
+// Prepared statements
+const stmts = {
+    getKey: db.prepare('SELECT x25519_public_key FROM keys WHERE address = ?'),
+    setKey: db.prepare('INSERT OR REPLACE INTO keys (address, x25519_public_key) VALUES (?, ?)'),
+    getAllKeys: db.prepare('SELECT address, x25519_public_key FROM keys'),
+
+    insertMessage: db.prepare('INSERT INTO messages (id, sender, recipient, nonce, ciphertext, created_at) VALUES (?, ?, ?, ?, ?, ?)'),
+    getMessages: db.prepare('SELECT * FROM messages WHERE recipient = ? AND created_at > ? ORDER BY created_at ASC'),
+    getUserMessages: db.prepare('SELECT * FROM messages WHERE sender = ? OR recipient = ? ORDER BY created_at ASC'),
+    getUserMessagesSince: db.prepare('SELECT * FROM messages WHERE (sender = ? OR recipient = ?) AND created_at > ? ORDER BY created_at ASC'),
+    deleteUserMessages: db.prepare('DELETE FROM messages WHERE sender = ? OR recipient = ?'),
+    getAllMessages: db.prepare('SELECT * FROM messages ORDER BY created_at ASC'),
+};
+
+// SSE clients (in-memory, not persisted)
 const sseClients = new Map();     // address -> Set of response objects
 
 // Base58 decode for verification
@@ -50,6 +88,20 @@ function base58Decode(str) {
 
 // Middleware
 app.use(express.json());
+
+// Rewrite /xchat/api/* to /api/* for proxy compatibility
+app.use((req, res, next) => {
+    if (req.path.startsWith('/xchat/api/')) {
+        req.url = req.url.replace('/xchat/api/', '/api/');
+    }
+    next();
+});
+
+// Serve xchat for /xchat route (before static middleware)
+app.get('/xchat', (req, res) => {
+    res.sendFile(join(__dirname, 'public', 'xchat.html'));
+});
+
 app.use(express.static(join(__dirname, 'public')));
 
 // CORS
@@ -93,7 +145,7 @@ app.post('/api/keys', (req, res) => {
             return res.status(401).json({ error: 'Invalid signature' });
         }
 
-        keyRegistry.set(address, x25519PublicKey);
+        stmts.setKey.run(address, x25519PublicKey);
         console.log(`[Keys] Registered: ${address.slice(0, 8)}...`);
         res.json({ success: true });
 
@@ -104,11 +156,11 @@ app.post('/api/keys', (req, res) => {
 });
 
 app.get('/api/keys/:address', (req, res) => {
-    const key = keyRegistry.get(req.params.address);
-    if (!key) {
+    const row = stmts.getKey.get(req.params.address);
+    if (!row) {
         return res.status(404).json({ error: 'Not found' });
     }
-    res.json({ address: req.params.address, x25519PublicKey: key });
+    res.json({ address: req.params.address, x25519PublicKey: row.x25519_public_key });
 });
 
 // ============================================================================
@@ -117,6 +169,7 @@ app.get('/api/keys/:address', (req, res) => {
 
 app.get('/api/stream/:address', (req, res) => {
     const address = req.params.address;
+    const since = parseInt(req.query.since) || 0;
 
     // Set SSE headers
     res.setHeader('Content-Type', 'text/event-stream');
@@ -125,21 +178,29 @@ app.get('/api/stream/:address', (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.flushHeaders();
 
-    // Send initial connection message
-    res.write(`data: ${JSON.stringify({ type: 'connected' })}\n\n`);
-
     // Register this client
     if (!sseClients.has(address)) {
         sseClients.set(address, new Set());
     }
     sseClients.get(address).add(res);
-    console.log(`[SSE] Connected: ${address.slice(0, 8)}... (${sseClients.get(address).size} clients)`);
 
-    // Send any pending messages
-    const pending = messageStore.get(address) || [];
-    for (const msg of pending) {
+    // Fetch messages newer than 'since' timestamp
+    const rows = stmts.getUserMessagesSince.all(address, address, since);
+    const messageCount = rows.length;
+
+    // Send initial connection message with sync info
+    res.write(`data: ${JSON.stringify({ type: 'connected', since, messageCount })}\n\n`);
+
+    console.log(`[SSE] Connected: ${address.slice(0, 8)}... (${sseClients.get(address).size} clients, syncing ${messageCount} msgs since ${since})`);
+
+    // Send only messages newer than 'since'
+    for (const r of rows) {
+        const msg = { id: r.id, from: r.sender, to: r.recipient, nonce: r.nonce, ciphertext: r.ciphertext, timestamp: r.created_at };
         res.write(`data: ${JSON.stringify({ type: 'message', message: msg })}\n\n`);
     }
+
+    // Signal that history sync is complete
+    res.write(`data: ${JSON.stringify({ type: 'history_complete', count: messageCount })}\n\n`);
 
     // Heartbeat to keep connection alive
     const heartbeat = setInterval(() => {
@@ -170,11 +231,8 @@ app.post('/api/messages', (req, res) => {
         timestamp: Date.now()
     };
 
-    // Store message
-    if (!messageStore.has(to)) {
-        messageStore.set(to, []);
-    }
-    messageStore.get(to).push(message);
+    // Store message in SQLite
+    stmts.insertMessage.run(message.id, from, to, nonce, ciphertext, message.timestamp);
 
     // Push to connected SSE clients
     const clients = sseClients.get(to);
@@ -193,8 +251,15 @@ app.post('/api/messages', (req, res) => {
 
 app.get('/api/messages/:address', (req, res) => {
     const since = parseInt(req.query.since) || 0;
-    const messages = (messageStore.get(req.params.address) || [])
-        .filter(m => m.timestamp > since);
+    const rows = stmts.getMessages.all(req.params.address, since);
+    const messages = rows.map(r => ({
+        id: r.id,
+        from: r.sender,
+        to: r.recipient,
+        nonce: r.nonce,
+        ciphertext: r.ciphertext,
+        timestamp: r.created_at
+    }));
     res.json({ messages });
 });
 
@@ -228,20 +293,8 @@ app.delete('/api/messages/:address', (req, res) => {
         }
 
         // Delete messages where this address is sender OR recipient
-        let deletedCount = 0;
-
-        for (const [recipient, messages] of messageStore.entries()) {
-            const before = messages.length;
-            const filtered = messages.filter(m => m.from !== address && m.to !== address);
-            if (filtered.length < before) {
-                deletedCount += before - filtered.length;
-                if (filtered.length === 0) {
-                    messageStore.delete(recipient);
-                } else {
-                    messageStore.set(recipient, filtered);
-                }
-            }
-        }
+        const result = stmts.deleteUserMessages.run(address, address);
+        const deletedCount = result.changes;
 
         console.log(`[Msg] Deleted ${deletedCount} messages for ${address.slice(0, 8)}...`);
         res.json({ success: true, deleted: deletedCount });
@@ -250,6 +303,24 @@ app.delete('/api/messages/:address', (req, res) => {
         console.error('[Msg] Delete error:', e.message);
         res.status(400).json({ error: 'Delete failed' });
     }
+});
+
+// ============================================================================
+// DEBUG
+// ============================================================================
+
+app.get('/api/debug/dump', (req, res) => {
+    const keys = stmts.getAllKeys.all();
+    const messages = stmts.getAllMessages.all();
+    const dump = {
+        keys: keys.reduce((acc, r) => { acc[r.address] = r.x25519_public_key; return acc; }, {}),
+        messages: messages.map(r => ({
+            id: r.id, from: r.sender, to: r.recipient,
+            nonce: r.nonce, ciphertext: r.ciphertext, timestamp: r.created_at
+        })),
+        sseClients: Object.fromEntries([...sseClients.entries()].map(([k, v]) => [k, v.size]))
+    };
+    res.json(dump);
 });
 
 // ============================================================================
