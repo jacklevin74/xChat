@@ -263,10 +263,68 @@ async function sendMessageToServer(from, to, nonce, ciphertext) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ from, to, nonce, ciphertext })
         });
-        return res.ok;
+        if (!res.ok) return null;
+        const data = await res.json();
+        return data.id;  // Return server-generated message ID
     } catch (e) {
         console.error('Send message failed:', e);
-        return false;
+        return null;
+    }
+}
+
+async function sendReadReceipts(contactAddress) {
+    if (!state.wallet) return;
+
+    // Get unread received messages from this contact
+    const messages = state.messages.get(contactAddress) || [];
+    const unreadIds = messages
+        .filter(m => m.direction === 'received' && !m.readAt)
+        .map(m => m.id);
+
+    if (unreadIds.length === 0) return;
+
+    try {
+        const res = await fetch(`${API_BASE}/api/messages/read`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ reader: state.wallet, messageIds: unreadIds })
+        });
+
+        if (res.ok) {
+            // Mark messages as read locally
+            const now = Date.now();
+            for (const msg of messages) {
+                if (unreadIds.includes(msg.id)) {
+                    msg.readAt = now;
+                }
+            }
+            console.log(`[Read] Sent read receipts for ${unreadIds.length} messages`);
+        }
+    } catch (e) {
+        console.error('Send read receipts failed:', e);
+    }
+}
+
+// Update message read status from SSE event
+function updateMessageReadStatus(messageId, readAt) {
+    // Find and update the message in any conversation
+    for (const [address, messages] of state.messages) {
+        for (const msg of messages) {
+            if (msg.id === messageId) {
+                msg.readAt = readAt;
+                msg.read = true;
+                // If this is the active chat, update the checkmark
+                if (state.activeChat === address) {
+                    const statusEl = document.querySelector(`.message-status[data-msg-id="${messageId}"]`);
+                    if (statusEl) {
+                        statusEl.classList.remove('sent');
+                        statusEl.classList.add('read');
+                        statusEl.innerHTML = `<svg viewBox="0 0 20 12" style="overflow:visible"><path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" d="M1 6l4 4 8-8"/><path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" d="M9 10l8-8"/></svg>`;
+                    }
+                }
+                return;
+            }
+        }
     }
 }
 
@@ -359,6 +417,7 @@ async function processIncomingMessage(msg) {
             timestamp: msg.timestamp,
             direction: isSent ? 'sent' : 'received',
             contactAddress,
+            readAt: msg.readAt || null,
         };
     } catch (e) {
         console.error('Decrypt failed:', e);
@@ -418,6 +477,9 @@ function connectSSE() {
                 renderMessages();
             } else if (data.type === 'ping') {
                 // Heartbeat
+            } else if (data.type === 'read_receipt') {
+                // Someone read our message - update to double checkmark
+                updateMessageReadStatus(data.messageId, data.readAt);
             } else if (data.type === 'message') {
                 const decrypted = await processIncomingMessage(data.message);
                 if (decrypted) {
@@ -452,9 +514,13 @@ function connectSSE() {
                         updateContactsList();
                         if (state.activeChat === decrypted.contactAddress) {
                             renderMessages();
+                            // Send read receipt immediately if viewing this chat and window is focused
+                            if (decrypted.direction === 'received' && document.hasFocus()) {
+                                sendReadReceipts(decrypted.contactAddress);
+                            }
                         }
                         if (decrypted.direction === 'received') {
-                            showToast('New message received!', 'success');
+                            showNewMessageToast();
                         }
                     }
                 }
@@ -503,6 +569,45 @@ function updateConnectionStatus(online) {
 // ============================================================================
 // UI FUNCTIONS
 // ============================================================================
+
+// Rate limiting for new message toasts
+const messageToastState = {
+    recentToasts: [],      // Timestamps of recent "new message" toasts
+    pendingCount: 0,       // Count of messages since last toast
+    batchTimeout: null,    // Timeout for showing batched toast
+};
+
+function showNewMessageToast() {
+    const now = Date.now();
+    const TOAST_WINDOW = 5000;  // 5 second window
+    const MAX_TOASTS = 3;
+
+    // Clean up old timestamps
+    messageToastState.recentToasts = messageToastState.recentToasts.filter(t => now - t < TOAST_WINDOW);
+
+    if (messageToastState.recentToasts.length < MAX_TOASTS) {
+        // Under limit - show individual toast
+        messageToastState.recentToasts.push(now);
+        showToast('New message received!', 'success');
+    } else {
+        // Over limit - batch them
+        messageToastState.pendingCount++;
+
+        // Clear existing batch timeout
+        if (messageToastState.batchTimeout) {
+            clearTimeout(messageToastState.batchTimeout);
+        }
+
+        // Show batched toast after a short delay
+        messageToastState.batchTimeout = setTimeout(() => {
+            if (messageToastState.pendingCount > 0) {
+                showToast(`${messageToastState.pendingCount}+ new messages`, 'success');
+                messageToastState.pendingCount = 0;
+                messageToastState.recentToasts.push(Date.now());
+            }
+        }, 1000);
+    }
+}
 
 function showToast(message, type = 'info') {
     const container = document.getElementById('toastContainer');
@@ -636,10 +741,24 @@ function renderMessages() {
             const direction = msg.direction || 'received';
             const content = msg.content || '';
 
+            // Checkmarks for sent messages: single = sent, double = read
+            let statusHtml = '';
+            if (direction === 'sent') {
+                const isRead = msg.readAt || msg.read;
+                const statusClass = isRead ? 'read' : 'sent';
+                const checkmark = isRead
+                    ? `<svg viewBox="0 0 20 12" style="overflow:visible"><path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" d="M1 6l4 4 8-8"/><path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" d="M9 10l8-8"/></svg>`  // Double checkmark
+                    : `<svg viewBox="0 0 14 12"><path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" d="M1 6l4 4 8-8"/></svg>`;  // Single checkmark
+                statusHtml = `<span class="message-status ${statusClass}" data-msg-id="${msg.id}">${checkmark}</span>`;
+            }
+
             html += `
-                <div class="message ${direction}">
+                <div class="message ${direction}" data-msg-id="${msg.id}">
                     <div class="message-content">${escapeHtml(content)}</div>
-                    <div class="message-time">${time}</div>
+                    <div class="message-meta">
+                        <span class="message-time">${time}</span>
+                        ${statusHtml}
+                    </div>
                 </div>
             `;
         }
@@ -706,6 +825,9 @@ window.selectChat = function(address) {
         updateContactsList();
         renderMessages();
 
+        // Send read receipts for unread messages in this chat
+        sendReadReceipts(address);
+
         const messageInput = document.getElementById('messageInput');
         if (messageInput) messageInput.focus();
     } catch (e) {
@@ -719,6 +841,31 @@ window.copyAddress = function() {
         showToast('Address copied!', 'success');
     }
 };
+
+window.copyWalletAddress = function() {
+    if (state.wallet) {
+        navigator.clipboard.writeText(state.wallet);
+        showToast('Your address copied!', 'success');
+    }
+};
+
+function updateWalletDisplay() {
+    const badgeEl = document.getElementById('walletBadge');
+    const textEl = document.getElementById('walletAddressText');
+    const avatarEl = document.getElementById('walletAvatar');
+    if (!badgeEl || !textEl) return;
+
+    if (state.wallet) {
+        // Show first 5 characters only
+        textEl.textContent = state.wallet.slice(0, 5);
+        if (avatarEl) {
+            avatarEl.textContent = state.wallet.slice(0, 2).toUpperCase();
+        }
+        badgeEl.classList.add('visible');
+    } else {
+        badgeEl.classList.remove('visible');
+    }
+}
 
 window.deleteConversation = async function() {
     if (!state.activeChat || !state.walletProvider) return;
@@ -801,20 +948,20 @@ window.sendMessage = async function() {
         const plaintext = new TextEncoder().encode(content);
         const { nonce, ciphertext } = encrypt(contact.sessionKey, plaintext);
 
-        const sent = await sendMessageToServer(
+        const messageId = await sendMessageToServer(
             state.wallet,
             state.activeChat,
             base58Encode(nonce),
             base58Encode(ciphertext)
         );
 
-        if (!sent) {
+        if (!messageId) {
             showToast('Failed to send', 'error');
             return;
         }
 
         const message = {
-            id: bytesToHex(randomBytes(8)),
+            id: messageId,  // Use server-generated ID for read receipt matching
             from: state.wallet,
             to: state.activeChat,
             content,
@@ -858,6 +1005,32 @@ document.addEventListener('DOMContentLoaded', () => {
 // WALLET CONNECTION
 // ============================================================================
 
+function updateConnectOverlay(state, walletAddress = null) {
+    const messageEl = document.getElementById('connectMessage');
+    const walletInfoEl = document.getElementById('connectedWalletInfo');
+    const walletAddrEl = document.getElementById('connectedWalletAddr');
+    const connectBtn = document.getElementById('connectBtn');
+
+    if (!messageEl || !connectBtn) return;
+
+    if (state === 'sign' && walletAddress) {
+        // Wallet connected, needs signature
+        messageEl.textContent = 'Sign the message in your wallet to create an encrypted session';
+        if (walletInfoEl) walletInfoEl.style.display = 'block';
+        if (walletAddrEl) walletAddrEl.textContent = `${walletAddress.slice(0, 4)}...${walletAddress.slice(-4)}`;
+        connectBtn.textContent = 'Waiting for signature...';
+        connectBtn.disabled = true;
+        connectBtn.style.opacity = '0.7';
+    } else {
+        // Reset to initial state
+        messageEl.textContent = 'Connect your wallet to start secure, end-to-end encrypted messaging';
+        if (walletInfoEl) walletInfoEl.style.display = 'none';
+        connectBtn.textContent = 'Connect Wallet';
+        connectBtn.disabled = false;
+        connectBtn.style.opacity = '1';
+    }
+}
+
 window.connectWallet = async function() {
     try {
         // Wait a moment for wallet extensions to fully initialize
@@ -871,16 +1044,11 @@ window.connectWallet = async function() {
             return;
         }
 
-        // Check if already connected (some wallets auto-connect)
-        let walletAddress;
-        if (provider.publicKey) {
-            walletAddress = provider.publicKey.toString();
-            console.log('[Connect] Wallet already connected:', walletAddress.slice(0, 8));
-        } else {
-            console.log('[Connect] Requesting wallet connection...');
-            const resp = await provider.connect();
-            walletAddress = resp.publicKey.toString();
-        }
+        // Always call connect() to ensure wallet is fully connected
+        // (publicKey may exist from previous session but wallet disconnected internally)
+        console.log('[Connect] Requesting wallet connection...');
+        const resp = await provider.connect();
+        const walletAddress = resp.publicKey.toString();
         state.wallet = walletAddress;
         state.walletProvider = provider;
         localStorage.setItem('x1msg-wallet', walletAddress);
@@ -894,11 +1062,15 @@ window.connectWallet = async function() {
         if (cached) {
             signatureBytes = base58Decode(cached);
         } else {
-            showToast('Please sign to generate encryption keys...', 'info');
+            // Update overlay to show wallet connected, needs signature
+            updateConnectOverlay('sign', walletAddress);
+
             const message = new TextEncoder().encode(SIGN_MESSAGE);
             const { signature } = await provider.signMessage(message, 'utf8');
             signatureBytes = signature;
             localStorage.setItem(cacheKey, base58Encode(signature));
+            // Wait for wallet popup to fully close before next signature request
+            await new Promise(r => setTimeout(r, 500));
         }
 
         const keyPair = deriveX25519KeyPair(signatureBytes);
@@ -921,10 +1093,14 @@ window.connectWallet = async function() {
 
         document.getElementById('connectOverlay').classList.add('hidden');
         document.getElementById('disconnectBtn')?.classList.remove('hidden');
+        updateWalletDisplay();
         connectSSE();
         showToast('Connected!', 'success');
 
     } catch (e) {
+        // Reset overlay to initial state
+        updateConnectOverlay('reset');
+
         // Check if user rejected/cancelled the request
         const isUserRejection = e.message?.includes('User rejected') ||
                                 e.message?.includes('User cancelled') ||
@@ -977,6 +1153,7 @@ window.disconnectWallet = function() {
     document.getElementById('chatView').classList.add('hidden');
     document.getElementById('contactsList').innerHTML = '';
     updateConnectionStatus(false);
+    updateWalletDisplay();
 
     showToast('Disconnected', 'info');
 };
@@ -1019,6 +1196,7 @@ async function tryAutoReconnect() {
 
         document.getElementById('connectOverlay').classList.add('hidden');
         document.getElementById('disconnectBtn')?.classList.remove('hidden');
+        updateWalletDisplay();
         connectSSE();
         console.log('[Auto] Restored session:', cachedWallet);
 
@@ -1035,6 +1213,19 @@ async function tryAutoReconnect() {
 document.addEventListener('DOMContentLoaded', () => {
     console.log('X1 Chat initialized');
     setTimeout(tryAutoReconnect, 500);
+
+    // Send read receipts when user focuses the window/tab
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible' && state.activeChat) {
+            sendReadReceipts(state.activeChat);
+        }
+    });
+
+    window.addEventListener('focus', () => {
+        if (state.activeChat) {
+            sendReadReceipts(state.activeChat);
+        }
+    });
 });
 
 // Debug

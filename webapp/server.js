@@ -27,12 +27,20 @@ db.exec(`
         recipient TEXT NOT NULL,
         nonce TEXT NOT NULL,
         ciphertext TEXT NOT NULL,
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        read_at INTEGER DEFAULT NULL
     );
 
     CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient, created_at);
     CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender);
 `);
+
+// Add read_at column if it doesn't exist (migration for existing DBs)
+try {
+    db.exec('ALTER TABLE messages ADD COLUMN read_at INTEGER DEFAULT NULL');
+} catch (e) {
+    // Column already exists
+}
 
 // Prepared statements
 const stmts = {
@@ -46,6 +54,8 @@ const stmts = {
     getUserMessagesSince: db.prepare('SELECT * FROM messages WHERE (sender = ? OR recipient = ?) AND created_at > ? ORDER BY created_at ASC'),
     deleteUserMessages: db.prepare('DELETE FROM messages WHERE sender = ? OR recipient = ?'),
     getAllMessages: db.prepare('SELECT * FROM messages ORDER BY created_at ASC'),
+    markMessagesRead: db.prepare('UPDATE messages SET read_at = ? WHERE id IN (SELECT value FROM json_each(?)) AND recipient = ? AND read_at IS NULL'),
+    getMessageById: db.prepare('SELECT * FROM messages WHERE id = ?'),
 };
 
 // SSE clients (in-memory, not persisted)
@@ -194,10 +204,13 @@ app.get('/api/stream/:address', (req, res) => {
     console.log(`[SSE] Connected: ${address.slice(0, 8)}... (${sseClients.get(address).size} clients, syncing ${messageCount} msgs since ${since})`);
 
     // Send only messages newer than 'since'
+    let readCount = 0;
     for (const r of rows) {
-        const msg = { id: r.id, from: r.sender, to: r.recipient, nonce: r.nonce, ciphertext: r.ciphertext, timestamp: r.created_at };
+        const msg = { id: r.id, from: r.sender, to: r.recipient, nonce: r.nonce, ciphertext: r.ciphertext, timestamp: r.created_at, readAt: r.read_at || null };
+        if (r.read_at) readCount++;
         res.write(`data: ${JSON.stringify({ type: 'message', message: msg })}\n\n`);
     }
+    console.log(`[SSE] Sent ${rows.length} messages, ${readCount} with readAt`);
 
     // Signal that history sync is complete
     res.write(`data: ${JSON.stringify({ type: 'history_complete', count: messageCount })}\n\n`);
@@ -249,6 +262,46 @@ app.post('/api/messages', (req, res) => {
     res.json({ success: true, id: message.id });
 });
 
+// Mark messages as read - sends read receipt to sender
+app.post('/api/messages/read', (req, res) => {
+    const { reader, messageIds } = req.body;
+    if (!reader || !messageIds || !Array.isArray(messageIds) || messageIds.length === 0) {
+        return res.status(400).json({ error: 'Missing fields' });
+    }
+
+    const now = Date.now();
+
+    // Get messages that will be marked as read (to notify senders)
+    const messagesToNotify = [];
+    for (const id of messageIds) {
+        const msg = stmts.getMessageById.get(id);
+        if (msg && msg.recipient === reader && !msg.read_at) {
+            messagesToNotify.push({ id: msg.id, sender: msg.sender });
+        }
+    }
+
+    // Mark messages as read in database
+    const result = stmts.markMessagesRead.run(now, JSON.stringify(messageIds), reader);
+    console.log(`[Read] ${reader.slice(0, 8)}... marked ${result.changes} messages as read`);
+
+    // Notify senders via SSE
+    console.log(`[Read] Notifying ${messagesToNotify.length} senders`);
+    for (const { id, sender } of messagesToNotify) {
+        const clients = sseClients.get(sender);
+        if (clients && clients.size > 0) {
+            const data = JSON.stringify({ type: 'read_receipt', messageId: id, readAt: now });
+            console.log(`[Read] Sending read_receipt to ${sender.slice(0, 8)}... for msg ${id}`);
+            for (const client of clients) {
+                client.write(`data: ${data}\n\n`);
+            }
+        } else {
+            console.log(`[Read] Sender ${sender.slice(0, 8)}... not connected`);
+        }
+    }
+
+    res.json({ success: true, marked: result.changes });
+});
+
 app.get('/api/messages/:address', (req, res) => {
     const since = parseInt(req.query.since) || 0;
     const rows = stmts.getMessages.all(req.params.address, since);
@@ -258,7 +311,8 @@ app.get('/api/messages/:address', (req, res) => {
         to: r.recipient,
         nonce: r.nonce,
         ciphertext: r.ciphertext,
-        timestamp: r.created_at
+        timestamp: r.created_at,
+        readAt: r.read_at || null
     }));
     res.json({ messages });
 });

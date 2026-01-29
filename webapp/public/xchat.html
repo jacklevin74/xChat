@@ -82,15 +82,23 @@
             padding: 12px 16px;
             border-bottom: 1px solid var(--border-color);
             display: flex;
+            flex-direction: column;
+            gap: 10px;
+            background: var(--bg-secondary);
+        }
+
+        .sidebar-header-top {
+            display: flex;
             align-items: center;
             justify-content: space-between;
-            background: var(--bg-secondary);
+            width: 100%;
         }
 
         .sidebar-header h1 {
             font-size: 16px;
             font-weight: 700;
             color: var(--green);
+            white-space: nowrap;
         }
 
         .sidebar-header h1 span {
@@ -103,7 +111,7 @@
         .header-actions {
             display: flex;
             align-items: center;
-            gap: 10px;
+            gap: 8px;
         }
 
         .sidebar-header .status {
@@ -112,6 +120,74 @@
             gap: 6px;
             font-size: 11px;
             color: var(--text-secondary);
+        }
+
+        .wallet-badge {
+            display: none;
+            align-items: center;
+            gap: 10px;
+            width: 100%;
+            padding: 8px 10px;
+            background: linear-gradient(135deg, rgba(34, 197, 94, 0.1) 0%, rgba(34, 197, 94, 0.05) 100%);
+            border: 1px solid rgba(34, 197, 94, 0.2);
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .wallet-badge:hover {
+            background: linear-gradient(135deg, rgba(34, 197, 94, 0.15) 0%, rgba(34, 197, 94, 0.08) 100%);
+            border-color: rgba(34, 197, 94, 0.3);
+        }
+
+        .wallet-badge.visible {
+            display: flex;
+        }
+
+        .wallet-badge-avatar {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            background: var(--green);
+            color: var(--bg-primary);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-size: 12px;
+            flex-shrink: 0;
+        }
+
+        .wallet-badge-info {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .wallet-badge-label {
+            font-size: 10px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .wallet-badge-address {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-primary);
+            font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        }
+
+        .wallet-badge-copy {
+            color: var(--text-muted);
+            font-size: 10px;
+            display: flex;
+            align-items: center;
+            gap: 3px;
+        }
+
+        .wallet-badge-copy svg {
+            width: 12px;
+            height: 12px;
         }
 
         .disconnect-btn {
@@ -392,44 +468,77 @@
 
         .message {
             max-width: 65%;
-            padding: 10px 14px;
+            padding: 6px 10px 6px 10px;
             position: relative;
             word-wrap: break-word;
             border: none;
+            display: flex;
+            flex-wrap: wrap;
+            align-items: flex-end;
+            gap: 8px;
         }
 
         .message.sent {
             align-self: flex-end;
-            background: var(--blue);
+            background: #2b5278;
             color: #fff;
-            border-radius: 18px 18px 4px 18px;
+            border-radius: 12px 12px 4px 12px;
         }
 
         .message.received {
             align-self: flex-start;
             background: var(--bg-tertiary);
             color: var(--text-primary);
-            border-radius: 18px 18px 18px 4px;
+            border-radius: 12px 12px 12px 4px;
         }
 
         .message-content {
             font-size: 14px;
-            line-height: 1.45;
+            line-height: 1.35;
+            flex: 1;
+            min-width: 0;
+        }
+
+        .message-meta {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-shrink: 0;
+            margin-left: auto;
+            padding-top: 2px;
         }
 
         .message-time {
-            font-size: 10px;
-            opacity: 0.7;
-            margin-top: 4px;
-            text-align: right;
+            font-size: 11px;
+            white-space: nowrap;
         }
 
         .message.sent .message-time {
-            color: rgba(255,255,255,0.7);
+            color: rgba(255,255,255,0.6);
         }
 
         .message.received .message-time {
             color: var(--text-muted);
+        }
+
+        .message-status {
+            display: inline-flex;
+            align-items: center;
+        }
+
+        .message-status svg {
+            width: 14px;
+            height: 12px;
+        }
+
+        .message-status.sent svg {
+            color: #8eb1d9;
+        }
+
+        .message-status.read svg {
+            width: 20px;
+            height: 12px;
+            color: #6eb5ff;
         }
 
         .message-date-divider {
@@ -547,6 +656,36 @@
             color: var(--text-secondary);
             margin-bottom: 20px;
             font-size: 13px;
+        }
+
+        .connected-wallet-info {
+            margin-bottom: 20px;
+        }
+
+        .connected-wallet-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            background: rgba(34, 197, 94, 0.1);
+            border: 1px solid rgba(34, 197, 94, 0.3);
+            padding: 8px 14px;
+            border-radius: 20px;
+            font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+            font-size: 13px;
+            color: var(--green);
+        }
+
+        .connected-dot {
+            width: 8px;
+            height: 8px;
+            background: var(--green);
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
         }
 
         .connect-btn {
@@ -732,8 +871,9 @@
             .search-box,
             .contact-info,
             .contact-meta,
-            .new-chat-btn span {
-                display: none;
+            .new-chat-btn span,
+            .wallet-badge {
+                display: none !important;
             }
             .contact-item {
                 justify-content: center;
@@ -754,17 +894,33 @@
         <!-- Sidebar -->
         <div class="sidebar">
             <div class="sidebar-header">
-                <h1>X1<span>Encrypted Chat</span></h1>
-                <div class="header-actions">
-                    <div class="status" id="connectionStatus">
-                        <span class="status-dot"></span>
-                        <span>Offline</span>
+                <div class="sidebar-header-top">
+                    <h1>X1<span>Encrypted Chat</span></h1>
+                    <div class="header-actions">
+                        <div class="status" id="connectionStatus">
+                            <span class="status-dot"></span>
+                            <span>Offline</span>
+                        </div>
+                        <button class="disconnect-btn hidden" id="disconnectBtn" onclick="disconnectWallet()" title="Disconnect wallet">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4M16 17l5-5-5-5M21 12H9"/>
+                            </svg>
+                        </button>
                     </div>
-                    <button class="disconnect-btn hidden" id="disconnectBtn" onclick="disconnectWallet()" title="Disconnect wallet">
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4M16 17l5-5-5-5M21 12H9"/>
+                </div>
+                <div class="wallet-badge" id="walletBadge" onclick="copyWalletAddress()" title="Click to copy full address">
+                    <div class="wallet-badge-avatar" id="walletAvatar">??</div>
+                    <div class="wallet-badge-info">
+                        <div class="wallet-badge-label">Connected Wallet</div>
+                        <div class="wallet-badge-address" id="walletAddressText">...</div>
+                    </div>
+                    <div class="wallet-badge-copy">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                            <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
                         </svg>
-                    </button>
+                        copy
+                    </div>
                 </div>
             </div>
             <div class="search-box">
@@ -839,8 +995,14 @@
     <div class="connect-overlay" id="connectOverlay">
         <div class="connect-card">
             <h2>X1 Encrypted Chat</h2>
-            <p>Connect your wallet to start secure, end-to-end encrypted messaging</p>
-            <button class="connect-btn" onclick="connectWallet()">Connect Wallet</button>
+            <p id="connectMessage">Connect your wallet to start secure, end-to-end encrypted messaging</p>
+            <div id="connectedWalletInfo" class="connected-wallet-info" style="display: none;">
+                <div class="connected-wallet-badge">
+                    <span class="connected-dot"></span>
+                    <span id="connectedWalletAddr">...</span>
+                </div>
+            </div>
+            <button class="connect-btn" id="connectBtn" onclick="connectWallet()">Connect Wallet</button>
         </div>
     </div>
 
