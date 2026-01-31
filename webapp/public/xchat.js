@@ -14,6 +14,34 @@ import { randomBytes } from '@noble/ciphers/webcrypto';
 const DOMAIN_SEPARATOR = 'x1-msg-v1';
 const SIGN_MESSAGE = 'X1 Encrypted Messaging - Sign to generate your encryption keys';
 const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+const DEMO_ADDRESS = 'DEMO';
+const DEMO_DELAY_BASE = 2400; // base ms between messages (3x slower)
+const DEMO_DELAY_RANDOM = () => 1000 + Math.random() * 4000; // 1-5 seconds random delay
+
+// Demo conversation messages - educational walkthrough
+const DEMO_MESSAGES = [
+    { direction: 'received', content: 'Welcome to X1 Encrypted Chat! Want to learn how it works?' },
+    { direction: 'sent', content: 'Yes! How does the encryption actually work?' },
+    { direction: 'received', content: 'Great question! When you sign in, your wallet signature is used to derive an X25519 encryption keypair using HKDF-SHA256' },
+    { direction: 'sent', content: 'So my wallet creates my encryption keys? That\'s clever!' },
+    { direction: 'received', content: 'Exactly! Your private encryption key never leaves your device. Only the public key is shared with the server' },
+    { direction: 'sent', content: 'What happens when I send a message to someone?' },
+    { direction: 'received', content: 'Your client performs ECDH (Elliptic Curve Diffie-Hellman) with the recipient\'s public key to create a shared secret' },
+    { direction: 'sent', content: 'And that shared secret encrypts the message?' },
+    { direction: 'received', content: 'Yes! Messages are encrypted with AES-256-GCM using that shared secret. Each message has a unique nonce for additional security' },
+    { direction: 'sent', content: 'Can the server read our messages?' },
+    { direction: 'received', content: 'No! The server only sees encrypted ciphertext. Without your private keys, messages are completely unreadable - even to us' },
+    { direction: 'sent', content: 'What about metadata? Can anyone see who I\'m talking to?' },
+    { direction: 'received', content: 'The server knows sender/recipient addresses for routing, but message content is fully encrypted end-to-end' },
+    { direction: 'sent', content: 'This seems perfect for business use cases!' },
+    { direction: 'received', content: 'Absolutely! You can use it for transaction invoicing - send payment requests with encrypted details only the payer can see' },
+    { direction: 'sent', content: 'And confirmations too? Like receipts for completed transactions?' },
+    { direction: 'received', content: 'Yes! Transaction confirmations, order details, contracts - all securely encrypted between wallet holders' },
+    { direction: 'sent', content: 'I notice the checkmarks - single when sent, double when read?' },
+    { direction: 'received', content: 'Exactly like Telegram! Single ✓ means delivered, double ✓✓ means the recipient has read it' },
+    { direction: 'sent', content: 'This is amazing. Secure wallet-to-wallet messaging on X1! 🔐' },
+    { direction: 'received', content: 'Try it out! Click "New Chat" and enter any X1 wallet address to start a secure conversation' },
+];
 
 const API_BASE = (() => {
     const path = window.location.pathname;
@@ -627,13 +655,25 @@ function updateContactsList() {
         const list = document.getElementById('contactsList');
         if (!list) return;
 
-        if (state.contacts.size === 0) {
-            list.innerHTML = `
-                <div style="padding: 40px 20px; text-align: center; color: var(--text-muted);">
-                    <p>No conversations yet</p>
-                    <p style="font-size: 13px; margin-top: 8px;">Start a new chat below</p>
+        let html = '';
+
+        // Always show Demo contact first
+        const isDemoActive = state.activeChat === DEMO_ADDRESS;
+        html += `
+            <div class="contact-item ${isDemoActive ? 'active' : ''}" onclick="selectDemo()">
+                <div class="contact-avatar" style="background: linear-gradient(135deg, #8b5cf6, #6366f1);">Demo</div>
+                <div class="contact-info">
+                    <div class="contact-name">Demo Conversation</div>
+                    <div class="contact-preview">See how encrypted chat works</div>
                 </div>
-            `;
+                <div class="contact-meta">
+                    <div class="contact-time"></div>
+                </div>
+            </div>
+        `;
+
+        if (state.contacts.size === 0) {
+            list.innerHTML = html;
             return;
         }
 
@@ -644,7 +684,6 @@ function updateContactsList() {
             return timeB - timeA;
         });
 
-        let html = '';
         for (const [address, contact] of sorted) {
             if (!address || !contact) continue;
 
@@ -814,6 +853,7 @@ window.selectChat = function(address) {
         if (avatar) {
             avatar.textContent = getAvatarLetters(address);
             avatar.className = `avatar ${getAvatarClass(address)}`;
+            avatar.style.background = '';  // Reset if coming from demo
         }
 
         const chatName = document.getElementById('chatName');
@@ -829,9 +869,72 @@ window.selectChat = function(address) {
         sendReadReceipts(address);
 
         const messageInput = document.getElementById('messageInput');
-        if (messageInput) messageInput.focus();
+        if (messageInput) {
+            messageInput.disabled = false;
+            messageInput.placeholder = 'Type a message...';
+            messageInput.focus();
+        }
     } catch (e) {
         console.error('[selectChat] Error:', e);
+    }
+};
+
+window.selectDemo = async function() {
+    state.activeChat = DEMO_ADDRESS;
+
+    // Update UI
+    const noChat = document.getElementById('noChat');
+    const chatView = document.getElementById('chatView');
+
+    if (noChat) noChat.classList.add('hidden');
+    if (chatView) chatView.classList.remove('hidden');
+
+    const avatar = document.getElementById('chatAvatar');
+    if (avatar) {
+        avatar.textContent = 'Demo';
+        avatar.className = 'avatar';
+        avatar.style.background = 'linear-gradient(135deg, #8b5cf6, #6366f1)';
+    }
+
+    const chatName = document.getElementById('chatName');
+    if (chatName) chatName.textContent = 'Demo Conversation';
+
+    const chatStatus = document.getElementById('chatStatus');
+    if (chatStatus) chatStatus.textContent = 'See how encrypted chat works';
+
+    updateContactsList();
+
+    // Clear messages container and run demo
+    const container = document.getElementById('messagesContainer');
+    if (container) container.innerHTML = '';
+
+    // Initialize demo messages array
+    state.messages.set(DEMO_ADDRESS, []);
+
+    // Display messages one by one with animation
+    const baseTime = Date.now() - (DEMO_MESSAGES.length * 3000);
+    for (let i = 0; i < DEMO_MESSAGES.length; i++) {
+        // Random delay between messages (1-5 seconds)
+        const delay = DEMO_DELAY_BASE + DEMO_DELAY_RANDOM();
+        await new Promise(resolve => setTimeout(resolve, delay));
+
+        if (state.activeChat !== DEMO_ADDRESS) return; // User switched away
+
+        const msg = {
+            id: `demo-${i}`,
+            ...DEMO_MESSAGES[i],
+            timestamp: baseTime + (i * 3000),
+            readAt: DEMO_MESSAGES[i].direction === 'received' ? Date.now() : (i < DEMO_MESSAGES.length - 1 ? Date.now() : null),
+        };
+        state.messages.get(DEMO_ADDRESS).push(msg);
+        renderMessages();
+    }
+
+    // Disable input for demo
+    const messageInput = document.getElementById('messageInput');
+    if (messageInput) {
+        messageInput.placeholder = 'Demo mode - start a real chat to send messages';
+        messageInput.disabled = true;
     }
 };
 
@@ -1212,6 +1315,7 @@ async function tryAutoReconnect() {
 
 document.addEventListener('DOMContentLoaded', () => {
     console.log('X1 Chat initialized');
+    updateContactsList();  // Show demo contact immediately
     setTimeout(tryAutoReconnect, 500);
 
     // Send read receipts when user focuses the window/tab
