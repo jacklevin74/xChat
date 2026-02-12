@@ -463,12 +463,33 @@ function updateMessagesList() {
 
 window.connectWallet = async function() {
     try {
-        // Find wallet provider
-        let provider = window.x1_wallet || window.x1Wallet || window.backpack ||
+        // Check if wallet is already available
+        let provider = window.x1Wallet || window.x1 || window.x1_wallet || window.backpack ||
                        window.phantom?.solana || window.solana;
 
+        // If not found, wait for wallet initialization events (up to 3 seconds)
         if (!provider) {
-            showToast('No wallet found. Install Phantom or Backpack.', 'error');
+            provider = await new Promise((resolve, reject) => {
+                const timeout = setTimeout(() => {
+                    const p = window.x1Wallet || window.x1 || window.x1_wallet || window.backpack ||
+                              window.phantom?.solana || window.solana;
+                    if (p) resolve(p);
+                    else reject(new Error('timeout'));
+                }, 3000);
+
+                const onInit = () => {
+                    clearTimeout(timeout);
+                    const p = window.x1Wallet || window.x1 || window.x1_wallet || window.backpack ||
+                              window.phantom?.solana || window.solana;
+                    if (p) resolve(p);
+                };
+                window.addEventListener('x1Wallet#initialized', onInit, { once: true });
+                window.addEventListener('solana#initialized', onInit, { once: true });
+            }).catch(() => null);
+        }
+
+        if (!provider) {
+            showToast('No wallet found. Please install X1 Wallet or Phantom.', 'error');
             return;
         }
 
@@ -725,7 +746,7 @@ async function tryAutoReconnect() {
         state.publicKey = keyPair.publicKey;
 
         // Find wallet provider (for sending, but don't connect yet)
-        state.walletProvider = window.x1_wallet || window.x1Wallet || window.backpack ||
+        state.walletProvider = window.x1Wallet || window.x1 || window.x1_wallet || window.backpack ||
                                window.phantom?.solana || window.solana;
 
         updateUI();

@@ -10,7 +10,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "demo": "tsx examples/demo.ts",
-    "webapp": "node webapp/server.js"
+    "webapp": "node webapp/server.js",
+    "bridge": "node bridge/tcp-bridge.js"
   },
   "dependencies": {
     "@noble/ciphers": "^0.5.0",

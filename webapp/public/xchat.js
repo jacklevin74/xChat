@@ -406,8 +406,13 @@ function getAvatarLetters(address) {
     return address.slice(0, 2).toUpperCase();
 }
 
+const ADDRESS_NAMES = {
+    '3MKtPR7rfkDRPsDqUQY1zs3DgQZePBqPUvmH6njtCkno': 'Theo Prime',
+};
+
 function shortenAddress(addr) {
     if (!addr || addr.length <= 12) return addr || '-';
+    if (ADDRESS_NAMES[addr]) return ADDRESS_NAMES[addr];
     return `${addr.slice(0, 6)}...${addr.slice(-4)}`;
 }
 
@@ -505,12 +510,19 @@ function connectSSE() {
                 renderMessages();
             } else if (data.type === 'ping') {
                 // Heartbeat
+            } else if (data.type === 'typing') {
+                showTypingIndicator(data.from);
             } else if (data.type === 'read_receipt') {
                 // Someone read our message - update to double checkmark
                 updateMessageReadStatus(data.messageId, data.readAt);
             } else if (data.type === 'message') {
                 const decrypted = await processIncomingMessage(data.message);
                 if (decrypted) {
+                    // Clear typing indicator when message arrives
+                    if (decrypted.direction === 'received') {
+                        hideTypingIndicator(decrypted.contactAddress);
+                    }
+
                     addMessageToChat(decrypted.contactAddress, decrypted);
 
                     // Track latest timestamp for incremental sync on reconnect
@@ -688,7 +700,7 @@ function updateContactsList() {
             if (!address || !contact) continue;
 
             const isActive = state.activeChat === address;
-            const preview = contact.lastMessage?.content || 'No messages yet';
+            const preview = contact._typing ? 'typing...' : (contact.lastMessage?.content || 'No messages yet');
             const time = contact.lastMessage ? formatTime(contact.lastMessage.timestamp) : '';
 
             // Escape the address for onclick to prevent injection
@@ -732,6 +744,84 @@ function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+}
+
+/**
+ * Render markdown-formatted text to HTML.
+ * Handles: bold, italic, code blocks, inline code, lists, headings, line breaks.
+ */
+function renderMarkdown(text) {
+    // Escape HTML first
+    let html = escapeHtml(text);
+
+    // Code blocks (```...```)
+    html = html.replace(/```(\w*)\n?([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
+
+    // Inline code (`...`)
+    html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+
+    // Bold (**...**)
+    html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+
+    // Italic (*...*)
+    html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+
+    // Split into lines for block-level processing
+    const lines = html.split('\n');
+    const result = [];
+    let inList = false;
+    let lastWasBreak = false;
+
+    for (const line of lines) {
+        const trimmed = line.trim();
+
+        // Horizontal rule (--- or ***)
+        if (/^[-*_]{3,}$/.test(trimmed)) {
+            if (inList) { result.push('</ul>'); inList = false; }
+            result.push('<hr style="border:none;border-top:1px solid rgba(255,255,255,0.1);margin:6px 0">');
+            lastWasBreak = true;
+        }
+        // Headings
+        else if (trimmed.startsWith('### ')) {
+            if (inList) { result.push('</ul>'); inList = false; }
+            result.push(`<strong>${trimmed.slice(4)}</strong>`);
+            lastWasBreak = false;
+        } else if (trimmed.startsWith('## ')) {
+            if (inList) { result.push('</ul>'); inList = false; }
+            result.push(`<strong>${trimmed.slice(3)}</strong>`);
+            lastWasBreak = false;
+        } else if (trimmed.startsWith('# ')) {
+            if (inList) { result.push('</ul>'); inList = false; }
+            result.push(`<strong>${trimmed.slice(2)}</strong>`);
+            lastWasBreak = false;
+        }
+        // List items (- or * with space, but not italic like *word*)
+        else if (/^[-] /.test(trimmed) || /^\* /.test(trimmed)) {
+            if (!inList) { result.push('<ul>'); inList = true; }
+            result.push(`<li>${trimmed.slice(2)}</li>`);
+            lastWasBreak = false;
+        }
+        // Numbered list items (1. 2. etc)
+        else if (/^\d+\.\s/.test(trimmed)) {
+            if (!inList) { result.push('<ol>'); inList = 'ol'; }
+            result.push(`<li>${trimmed.replace(/^\d+\.\s/, '')}</li>`);
+            lastWasBreak = false;
+        }
+        // Empty line — collapse consecutive blanks into one break
+        else if (trimmed === '') {
+            if (inList) { result.push(inList === 'ol' ? '</ol>' : '</ul>'); inList = false; lastWasBreak = true; }
+            if (!lastWasBreak) { result.push('<br>'); lastWasBreak = true; }
+        }
+        // Regular text
+        else {
+            if (inList) { result.push(inList === 'ol' ? '</ol>' : '</ul>'); inList = false; }
+            result.push(line);
+            lastWasBreak = false;
+        }
+    }
+    if (inList) result.push(inList === 'ol' ? '</ol>' : '</ul>');
+
+    return result.join('');
 }
 
 function addMessageToChat(address, message) {
@@ -793,7 +883,7 @@ function renderMessages() {
 
             html += `
                 <div class="message ${direction}" data-msg-id="${msg.id}">
-                    <div class="message-content">${escapeHtml(content)}</div>
+                    <div class="message-content">${renderMarkdown(content)}</div>
                     <div class="message-meta">
                         <span class="message-time">${time}</span>
                         ${statusHtml}
@@ -825,6 +915,57 @@ function formatDateDivider(timestamp) {
     } else {
         return date.toLocaleDateString([], { month: 'long', day: 'numeric', year: 'numeric' });
     }
+}
+
+// ============================================================================
+// TYPING INDICATOR
+// ============================================================================
+
+const typingTimers = new Map(); // address -> timeout ID
+
+function showTypingIndicator(fromAddress) {
+    // Clear existing timer for this sender
+    if (typingTimers.has(fromAddress)) {
+        clearTimeout(typingTimers.get(fromAddress));
+    }
+
+    // Auto-hide after 15 seconds (agent responses can take a while)
+    typingTimers.set(fromAddress, setTimeout(() => {
+        hideTypingIndicator(fromAddress);
+    }, 15000));
+
+    // Update chat status if this is the active chat
+    if (state.activeChat === fromAddress) {
+        const chatStatus = document.getElementById('chatStatus');
+        if (chatStatus) {
+            chatStatus.innerHTML = '<span class="typing-status">typing<span class="typing-dots"><span>.</span><span>.</span><span>.</span></span></span>';
+        }
+    }
+
+    // Update contact preview
+    const contact = state.contacts.get(fromAddress);
+    if (contact) {
+        contact._typing = true;
+        updateContactsList();
+    }
+}
+
+function hideTypingIndicator(fromAddress) {
+    typingTimers.delete(fromAddress);
+
+    const contact = state.contacts.get(fromAddress);
+    if (contact) {
+        contact._typing = false;
+    }
+
+    if (state.activeChat === fromAddress) {
+        const chatStatus = document.getElementById('chatStatus');
+        if (chatStatus) {
+            chatStatus.textContent = 'End-to-end encrypted';
+        }
+    }
+
+    updateContactsList();
 }
 
 // ============================================================================
@@ -1136,14 +1277,34 @@ function updateConnectOverlay(state, walletAddress = null) {
 
 window.connectWallet = async function() {
     try {
-        // Wait a moment for wallet extensions to fully initialize
-        await new Promise(r => setTimeout(r, 100));
-
-        let provider = window.x1_wallet || window.x1Wallet || window.backpack ||
+        // Check if wallet is already available
+        let provider = window.x1Wallet || window.x1 || window.x1_wallet || window.backpack ||
                        window.phantom?.solana || window.solana;
 
+        // If not found, wait for wallet initialization events (up to 3 seconds)
         if (!provider) {
-            showToast('No wallet found. Please install X1 Wallet.', 'error');
+            provider = await new Promise((resolve, reject) => {
+                const timeout = setTimeout(() => {
+                    // Final check before giving up
+                    const p = window.x1Wallet || window.x1 || window.x1_wallet || window.backpack ||
+                              window.phantom?.solana || window.solana;
+                    if (p) resolve(p);
+                    else reject(new Error('timeout'));
+                }, 3000);
+
+                const onInit = () => {
+                    clearTimeout(timeout);
+                    const p = window.x1Wallet || window.x1 || window.x1_wallet || window.backpack ||
+                              window.phantom?.solana || window.solana;
+                    if (p) resolve(p);
+                };
+                window.addEventListener('x1Wallet#initialized', onInit, { once: true });
+                window.addEventListener('solana#initialized', onInit, { once: true });
+            }).catch(() => null);
+        }
+
+        if (!provider) {
+            showToast('No wallet found. Please install X1 Wallet or Phantom.', 'error');
             return;
         }
 
@@ -1293,7 +1454,7 @@ async function tryAutoReconnect() {
         state.wallet = cachedWallet;
         state.privateKey = keyPair.privateKey;
         state.publicKey = keyPair.publicKey;
-        state.walletProvider = window.x1_wallet || window.x1Wallet || window.backpack ||
+        state.walletProvider = window.x1Wallet || window.x1 || window.x1_wallet || window.backpack ||
                                window.phantom?.solana || window.solana;
         loadReadMessages();
 
@@ -1316,7 +1477,22 @@ async function tryAutoReconnect() {
 document.addEventListener('DOMContentLoaded', () => {
     console.log('X1 Chat initialized');
     updateContactsList();  // Show demo contact immediately
-    setTimeout(tryAutoReconnect, 500);
+    // Wait longer for wallet extensions to inject their providers
+    const attemptReconnect = () => {
+        const hasWallet = window.x1Wallet || window.x1 || window.x1_wallet || window.backpack ||
+                          window.phantom?.solana || window.solana;
+        if (hasWallet) {
+            tryAutoReconnect();
+        } else {
+            // Listen for wallet init events as fallback
+            const onInit = () => tryAutoReconnect();
+            window.addEventListener('x1Wallet#initialized', onInit, { once: true });
+            window.addEventListener('solana#initialized', onInit, { once: true });
+            // Final fallback after 2 seconds
+            setTimeout(tryAutoReconnect, 2000);
+        }
+    };
+    setTimeout(attemptReconnect, 500);
 
     // Send read receipts when user focuses the window/tab
     document.addEventListener('visibilitychange', () => {

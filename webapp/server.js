@@ -2,12 +2,17 @@
 import express from 'express';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { readFileSync, existsSync } from 'fs';
+import { createServer } from 'https';
 import { ed25519 } from '@noble/curves/ed25519';
 import Database from 'better-sqlite3';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 3001;
+const HTTPS_PORT = process.env.HTTPS_PORT || 3443;
+const TLS_CERT = process.env.TLS_CERT || '/tmp/xchat-cert.pem';
+const TLS_KEY = process.env.TLS_KEY || '/tmp/xchat-key.pem';
 
 // SQLite database
 const db = new Database(join(__dirname, 'data', 'messages.db'));
@@ -99,19 +104,29 @@ function base58Decode(str) {
 // Middleware
 app.use(express.json());
 
-// Rewrite /xchat/api/* to /api/* for proxy compatibility
+// Rewrite /xchat/api/* or /xchat2/api/* to /api/* for proxy compatibility
 app.use((req, res, next) => {
-    if (req.path.startsWith('/xchat/api/')) {
-        req.url = req.url.replace('/xchat/api/', '/api/');
+    if (req.path.startsWith('/xchat/api/') || req.path.startsWith('/xchat2/api/')) {
+        req.url = req.url.replace(/^\/xchat2?\/api\//, '/api/');
     }
     next();
 });
 
-// Serve xchat for /xchat route (before static middleware)
-app.get('/xchat', (req, res) => {
+// Redirect /xchat2 to /xchat2/ so relative paths resolve correctly
+app.get(['/xchat', '/xchat2'], (req, res) => {
+    if (!req.originalUrl.endsWith('/') && !req.originalUrl.includes('?')) {
+        return res.redirect(301, req.originalUrl + '/');
+    }
     res.sendFile(join(__dirname, 'public', 'xchat.html'));
 });
 
+// Also serve the HTML at /xchat2/ (with trailing slash)
+app.get(['/xchat/', '/xchat2/'], (req, res) => {
+    res.sendFile(join(__dirname, 'public', 'xchat.html'));
+});
+
+// Serve static files under /xchat2/ for proxy compatibility
+app.use('/xchat2', express.static(join(__dirname, 'public')));
 app.use(express.static(join(__dirname, 'public')));
 
 // CORS
@@ -231,6 +246,22 @@ app.get('/api/stream/:address', (req, res) => {
 // ============================================================================
 // MESSAGES
 // ============================================================================
+
+app.post('/api/typing', (req, res) => {
+    const { from, to } = req.body;
+    if (!from || !to) {
+        return res.status(400).json({ error: 'Missing from or to' });
+    }
+
+    const clients = sseClients.get(to);
+    if (clients && clients.size > 0) {
+        const data = JSON.stringify({ type: 'typing', from });
+        for (const client of clients) {
+            client.write(`data: ${data}\n\n`);
+        }
+    }
+    res.json({ success: true });
+});
 
 app.post('/api/messages', (req, res) => {
     const { from, to, nonce, ciphertext } = req.body;
@@ -381,6 +412,7 @@ app.get('/api/debug/dump', (req, res) => {
 // START
 // ============================================================================
 
+// HTTP server
 app.listen(PORT, () => {
     console.log(`\nX1 Encrypted Messaging Server (SSE)`);
     console.log(`====================================`);
@@ -392,3 +424,18 @@ app.listen(PORT, () => {
     console.log(`  POST /api/messages    - Send message`);
     console.log(`  GET  /api/messages/:a - Get messages\n`);
 });
+
+// HTTPS server (needed for wallet extensions that require secure context)
+if (existsSync(TLS_CERT) && existsSync(TLS_KEY)) {
+    const httpsServer = createServer({
+        cert: readFileSync(TLS_CERT),
+        key: readFileSync(TLS_KEY),
+    }, app);
+    httpsServer.listen(HTTPS_PORT, '127.0.0.1', () => {
+        console.log(`HTTPS: https://localhost:${HTTPS_PORT}`);
+        console.log(`(X1 Wallet requires HTTPS for provider injection)\n`);
+    });
+} else {
+    console.log(`\nNo TLS certs found at ${TLS_CERT} / ${TLS_KEY}`);
+    console.log(`HTTPS disabled. X1 Wallet won't work over plain HTTP.\n`);
+}
