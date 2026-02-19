@@ -17,6 +17,8 @@ const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvw
 const DEMO_ADDRESS = 'DEMO';
 const DEMO_DELAY_BASE = 2400; // base ms between messages (3x slower)
 const DEMO_DELAY_RANDOM = () => 1000 + Math.random() * 4000; // 1-5 seconds random delay
+const STREAM_CHUNK_SIZE = 120; // bytes
+const STREAM_TTL_MS = 2 * 60 * 1000; // 2 minutes
 
 // Demo conversation messages - educational walkthrough
 const DEMO_MESSAGES = [
@@ -67,6 +69,7 @@ const state = {
     pendingContacts: new Map(), // address -> Promise (prevent race conditions)
     lastSyncTimestamp: 0,     // Track last synced message timestamp for incremental sync
     readMessageIds: new Set(), // Track which messages have been read (persisted to localStorage)
+    incomingStreams: new Map(), // stream_id -> { from, to, contactAddress, chunkTotal, receivedChunks, createdAt }
 };
 
 // ============================================================================
@@ -221,6 +224,18 @@ function encrypt(key, plaintext) {
     return { nonce, ciphertext: cipher.encrypt(plaintext) };
 }
 
+function generateStreamId() {
+    return base58Encode(randomBytes(12)) + '-' + Date.now().toString(36);
+}
+
+function chunkBytes(bytes, size) {
+    const chunks = [];
+    for (let i = 0; i < bytes.length; i += size) {
+        chunks.push(bytes.slice(i, i + size));
+    }
+    return chunks;
+}
+
 function decrypt(key, nonce, ciphertext) {
     return gcm(key, nonce).decrypt(ciphertext);
 }
@@ -284,12 +299,19 @@ async function lookupPublicKey(address) {
     }
 }
 
-async function sendMessageToServer(from, to, nonce, ciphertext) {
+async function sendMessageToServer(from, to, nonce, ciphertext, streamMeta = null) {
     try {
+        const payload = { from, to, nonce, ciphertext };
+        if (streamMeta) {
+            payload.stream_id = streamMeta.stream_id;
+            payload.chunk_index = streamMeta.chunk_index;
+            payload.chunk_total = streamMeta.chunk_total;
+            payload.is_final = streamMeta.is_final;
+        }
         const res = await fetch(`${API_BASE}/api/messages`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ from, to, nonce, ciphertext })
+            body: JSON.stringify(payload)
         });
         if (!res.ok) return null;
         const data = await res.json();
@@ -458,6 +480,84 @@ async function processIncomingMessage(msg) {
     }
 }
 
+async function processIncomingStreamChunk(data) {
+    try {
+        const { message } = data;
+        if (!message || !message.stream_id) return null;
+
+        const isSent = message.from === state.wallet;
+        const contactAddress = isSent ? message.to : message.from;
+
+        const contact = await getOrCreateContact(contactAddress);
+        if (!contact) {
+            console.log('[Stream] Failed to get contact for:', contactAddress?.slice(0,8));
+            return null;
+        }
+
+        const nonce = base58Decode(message.nonce);
+        const ciphertext = base58Decode(message.ciphertext);
+        const plaintext = decrypt(contact.sessionKey, nonce, ciphertext);
+        const content = new TextDecoder().decode(plaintext);
+
+        // Initialize stream tracking
+        if (!state.incomingStreams.has(message.stream_id)) {
+            state.incomingStreams.set(message.stream_id, {
+                from: message.from,
+                to: message.to,
+                contactAddress,
+                chunkTotal: message.chunk_total,
+                receivedChunks: new Map(),
+                createdAt: Date.now(),
+            });
+        }
+
+        const stream = state.incomingStreams.get(message.stream_id);
+        stream.receivedChunks.set(message.chunk_index, content);
+        // Update chunkTotal — final chunk has the authoritative total
+        if (message.is_final && message.chunk_total) {
+            stream.chunkTotal = message.chunk_total;
+        } else if (message.chunk_total && message.chunk_total > stream.chunkTotal) {
+            stream.chunkTotal = message.chunk_total;
+        }
+
+        // Reassemble in order from received chunks
+        const ordered = [];
+        const maxIdx = stream.receivedChunks.size;
+        for (let i = 0; i < maxIdx; i++) {
+            if (!stream.receivedChunks.has(i)) break;
+            ordered.push(stream.receivedChunks.get(i));
+        }
+        const assembled = ordered.join('');
+
+        // Ensure placeholder exists
+        const placeholder = ensureStreamPlaceholder(contactAddress, message.stream_id);
+        placeholder.from = message.from;
+        placeholder.to = message.to;
+        placeholder.timestamp = message.timestamp || Date.now();
+        placeholder.direction = isSent ? 'sent' : 'received';
+
+        const isFinal = !!message.is_final;
+        updateStreamingPlaceholder(contactAddress, message.stream_id, assembled, isFinal);
+
+        if (isFinal) {
+            state.incomingStreams.delete(message.stream_id);
+        }
+
+        return {
+            contactAddress,
+            stream_id: message.stream_id,
+            content: assembled,
+            is_final: isFinal,
+            direction: isSent ? 'sent' : 'received',
+        };
+    } catch (e) {
+        console.error('[Stream] Decrypt failed:', e);
+        return null;
+    } finally {
+        pruneExpiredStreams();
+    }
+}
+
 // ============================================================================
 // SSE CONNECTION
 // ============================================================================
@@ -515,6 +615,33 @@ function connectSSE() {
             } else if (data.type === 'read_receipt') {
                 // Someone read our message - update to double checkmark
                 updateMessageReadStatus(data.messageId, data.readAt);
+            } else if (data.type === 'stream_chunk') {
+                const chunkInfo = await processIncomingStreamChunk(data);
+                if (chunkInfo) {
+                    if (chunkInfo.direction === 'received') {
+                        hideTypingIndicator(chunkInfo.contactAddress);
+                    }
+
+                    // Update contact preview with streaming content
+                    const contact = state.contacts.get(chunkInfo.contactAddress);
+                    if (contact) {
+                        contact.lastMessage = {
+                            content: chunkInfo.content,
+                            timestamp: Date.now(),
+                        };
+                        contact._streaming = !chunkInfo.is_final;
+                    }
+
+                    if (state.historyLoaded) {
+                        updateContactsList();
+                        if (state.activeChat === chunkInfo.contactAddress) {
+                            renderMessages();
+                        }
+                        if (chunkInfo.direction === 'received' && chunkInfo.is_final) {
+                            showNewMessageToast();
+                        }
+                    }
+                }
             } else if (data.type === 'message') {
                 const decrypted = await processIncomingMessage(data.message);
                 if (decrypted) {
@@ -711,7 +838,7 @@ function updateContactsList() {
                     <div class="contact-avatar ${getAvatarClass(address)}">${getAvatarLetters(address)}</div>
                     <div class="contact-info">
                         <div class="contact-name">${shortenAddress(address)}</div>
-                        <div class="contact-preview">${escapeHtml(preview.slice(0, 30))}${preview.length > 30 ? '...' : ''}</div>
+                        <div class="contact-preview ${contact._streaming ? 'streaming' : ''}">${escapeHtml(preview.slice(0, 30))}${preview.length > 30 ? '...' : ''}</div>
                     </div>
                     <div class="contact-meta">
                         <div class="contact-time">${time}</div>
@@ -810,7 +937,7 @@ function renderMarkdown(text) {
         // Empty line — collapse consecutive blanks into one break
         else if (trimmed === '') {
             if (inList) { result.push(inList === 'ol' ? '</ol>' : '</ul>'); inList = false; lastWasBreak = true; }
-            if (!lastWasBreak) { result.push('<br>'); lastWasBreak = true; }
+            if (!lastWasBreak) { result.push('<div style="height:0.6em"></div>'); lastWasBreak = true; }
         }
         // Regular text
         else {
@@ -829,6 +956,46 @@ function addMessageToChat(address, message) {
         state.messages.set(address, []);
     }
     state.messages.get(address).push(message);
+}
+
+function ensureStreamPlaceholder(contactAddress, streamId) {
+    const messages = state.messages.get(contactAddress) || [];
+    const existing = messages.find(m => m.stream_id === streamId && m.is_streaming_placeholder);
+    if (existing) return existing;
+
+    const placeholder = {
+        id: `stream-${streamId}`,
+        stream_id: streamId,
+        from: null,
+        to: null,
+        content: '',
+        timestamp: Date.now(),
+        direction: 'received',
+        is_streaming_placeholder: true,
+        streaming: true,
+    };
+    addMessageToChat(contactAddress, placeholder);
+    return placeholder;
+}
+
+function updateStreamingPlaceholder(contactAddress, streamId, content, isFinal) {
+    const messages = state.messages.get(contactAddress) || [];
+    const placeholder = messages.find(m => m.stream_id === streamId && m.is_streaming_placeholder);
+    if (!placeholder) return;
+    placeholder.content = content;
+    placeholder.streaming = !isFinal;
+    if (isFinal) {
+        placeholder.is_streaming_placeholder = false;
+    }
+}
+
+function pruneExpiredStreams() {
+    const now = Date.now();
+    for (const [streamId, stream] of state.incomingStreams.entries()) {
+        if (now - stream.createdAt > STREAM_TTL_MS) {
+            state.incomingStreams.delete(streamId);
+        }
+    }
 }
 
 function renderMessages() {
@@ -868,7 +1035,30 @@ function renderMessages() {
 
             const time = new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
             const direction = msg.direction || 'received';
-            const content = msg.content || '';
+            
+            // Parse message content - may contain file data
+            let textContent = '';
+            let fileData = msg.file || null;
+            
+            if (msg.content) {
+                try {
+                    const parsed = JSON.parse(msg.content);
+                    if (parsed && typeof parsed === 'object') {
+                        textContent = parsed.text || '';
+                        fileData = parsed.file || fileData;
+                    } else {
+                        textContent = msg.content;
+                    }
+                } catch (e) {
+                    // Not JSON, treat as plain text
+                    textContent = msg.content;
+                }
+            }
+            
+            // Use msg.text if available (for locally created messages)
+            if (msg.text) {
+                textContent = msg.text;
+            }
 
             // Checkmarks for sent messages: single = sent, double = read
             let statusHtml = '';
@@ -881,9 +1071,25 @@ function renderMessages() {
                 statusHtml = `<span class="message-status ${statusClass}" data-msg-id="${msg.id}">${checkmark}</span>`;
             }
 
+            const streamingClass = msg.streaming ? ' streaming' : '';
+            const streamingDots = msg.streaming ? '<span class="streaming-dots"><span>.</span><span>.</span><span>.</span></span>' : '';
+
+            // Build file attachment HTML if present
+            let fileHtml = '';
+            if (fileData && fileData.fileId) {
+                fileHtml = renderFileAttachment(fileData, direction);
+            }
+
+            // Build text content HTML
+            let textHtml = '';
+            if (textContent) {
+                textHtml = renderMarkdown(textContent);
+            }
+
             html += `
-                <div class="message ${direction}" data-msg-id="${msg.id}">
-                    <div class="message-content">${renderMarkdown(content)}</div>
+                <div class="message ${direction}${streamingClass}" data-msg-id="${msg.id}">
+                    ${fileHtml}
+                    ${textHtml ? `<div class="message-content">${textHtml}${streamingDots}</div>` : ''}
                     <div class="message-meta">
                         <span class="message-time">${time}</span>
                         ${statusHtml}
@@ -1173,14 +1379,167 @@ window.startNewChat = async function() {
 };
 
 // ============================================================================
+// FILE UPLOAD
+// ============================================================================
+
+const fileState = {
+    selectedFile: null,
+    uploading: false,
+};
+
+function formatFileSize(bytes) {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+window.triggerFileUpload = function() {
+    if (fileState.uploading) return;
+    document.getElementById('fileInput').click();
+};
+
+window.handleFileSelect = function(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    // Check file size (50MB max)
+    if (file.size > 50 * 1024 * 1024) {
+        showToast('File too large. Max size is 50MB.', 'error');
+        event.target.value = '';
+        return;
+    }
+
+    fileState.selectedFile = file;
+
+    // Show preview bar
+    const previewBar = document.getElementById('filePreviewBar');
+    const previewName = document.getElementById('filePreviewName');
+    const previewSize = document.getElementById('filePreviewSize');
+
+    previewName.textContent = file.name;
+    previewSize.textContent = formatFileSize(file.size);
+    previewBar.classList.add('visible');
+};
+
+window.clearFileSelection = function() {
+    fileState.selectedFile = null;
+    document.getElementById('fileInput').value = '';
+    document.getElementById('filePreviewBar').classList.remove('visible');
+};
+
+async function uploadFile(file) {
+    const progressBar = document.getElementById('uploadProgress');
+    const progressFill = document.getElementById('uploadProgressFill');
+    const progressText = document.getElementById('uploadProgressText');
+
+    fileState.uploading = true;
+    progressBar.classList.add('visible');
+    progressFill.style.width = '0%';
+    progressText.textContent = 'Uploading...';
+
+    try {
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('uploader', state.wallet);
+
+        // Use XMLHttpRequest for progress tracking
+        return new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+
+            xhr.upload.onprogress = (e) => {
+                if (e.lengthComputable) {
+                    const percent = Math.round((e.loaded / e.total) * 100);
+                    progressFill.style.width = percent + '%';
+                    progressText.textContent = `Uploading... ${percent}%`;
+                }
+            };
+
+            xhr.onload = () => {
+                fileState.uploading = false;
+                progressBar.classList.remove('visible');
+
+                if (xhr.status === 200) {
+                    const response = JSON.parse(xhr.responseText);
+                    resolve(response);
+                } else {
+                    reject(new Error('Upload failed'));
+                }
+            };
+
+            xhr.onerror = () => {
+                fileState.uploading = false;
+                progressBar.classList.remove('visible');
+                reject(new Error('Upload failed'));
+            };
+
+            xhr.open('POST', `${API_BASE}/api/files`);
+            xhr.send(formData);
+        });
+    } catch (e) {
+        fileState.uploading = false;
+        progressBar.classList.remove('visible');
+        throw e;
+    }
+}
+
+function isImageMimeType(mimeType) {
+    return mimeType && mimeType.startsWith('image/');
+}
+
+function renderFileAttachment(fileData, direction) {
+    const { fileId, originalName, mimeType, size } = fileData;
+    const fileUrl = `${API_BASE}/api/files/${fileId}`;
+
+    if (isImageMimeType(mimeType)) {
+        return `
+            <a href="${fileUrl}" target="_blank" rel="noopener">
+                <img src="${fileUrl}" alt="${escapeHtml(originalName)}" class="message-file-image" 
+                     onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
+                <div class="message-file" style="display: none;">
+                    <div class="message-file-icon">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+                            <circle cx="8.5" cy="8.5" r="1.5"/>
+                            <path d="M21 15l-5-5L5 21"/>
+                        </svg>
+                    </div>
+                    <div class="message-file-info">
+                        <div class="message-file-name">${escapeHtml(originalName)}</div>
+                        <div class="message-file-size">${formatFileSize(size)}</div>
+                    </div>
+                </div>
+            </a>
+        `;
+    }
+
+    // Generic file attachment
+    return `
+        <a href="${fileUrl}" target="_blank" rel="noopener" class="message-file">
+            <div class="message-file-icon">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/>
+                    <path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/>
+                </svg>
+            </div>
+            <div class="message-file-info">
+                <div class="message-file-name">${escapeHtml(originalName)}</div>
+                <div class="message-file-size">${formatFileSize(size)}</div>
+            </div>
+        </a>
+    `;
+}
+
+// ============================================================================
 // SEND MESSAGE
 // ============================================================================
 
 window.sendMessage = async function() {
     const input = document.getElementById('messageInput');
-    const content = input.value.trim();
+    let content = input.value.trim();
+    const hasFile = fileState.selectedFile !== null;
 
-    if (!content || !state.activeChat) return;
+    if (!content && !hasFile) return;
+    if (!state.activeChat) return;
 
     const contact = state.contacts.get(state.activeChat);
     if (!contact) {
@@ -1189,7 +1548,80 @@ window.sendMessage = async function() {
     }
 
     try {
-        const plaintext = new TextEncoder().encode(content);
+        // Handle file upload first if present
+        let fileData = null;
+        if (hasFile) {
+            try {
+                const uploadResult = await uploadFile(fileState.selectedFile);
+                fileData = {
+                    fileId: uploadResult.fileId,
+                    originalName: uploadResult.originalName,
+                    mimeType: uploadResult.mimeType,
+                    size: uploadResult.size
+                };
+                clearFileSelection();
+            } catch (e) {
+                showToast('File upload failed', 'error');
+                return;
+            }
+        }
+
+        // Build message content - include file metadata if present
+        let messagePayload = {};
+        if (fileData) {
+            messagePayload.file = fileData;
+        }
+        if (content) {
+            messagePayload.text = content;
+        }
+
+        // If only text (no file), use simple string format for backward compatibility
+        const finalContent = fileData ? JSON.stringify(messagePayload) : content;
+        const plaintext = new TextEncoder().encode(finalContent);
+
+        if (plaintext.length > STREAM_CHUNK_SIZE) {
+            const streamId = generateStreamId();
+            const chunks = chunkBytes(plaintext, STREAM_CHUNK_SIZE);
+            const total = chunks.length;
+
+            for (let i = 0; i < chunks.length; i++) {
+                const { nonce, ciphertext } = encrypt(contact.sessionKey, chunks[i]);
+                const isFinal = i === chunks.length - 1;
+
+                await sendMessageToServer(
+                    state.wallet,
+                    state.activeChat,
+                    base58Encode(nonce),
+                    base58Encode(ciphertext),
+                    {
+                        stream_id: streamId,
+                        chunk_index: i,
+                        chunk_total: total,
+                        is_final: isFinal,
+                    }
+                );
+            }
+
+            // Show full message locally
+            const message = {
+                id: `stream-${streamId}`,
+                from: state.wallet,
+                to: state.activeChat,
+                content,
+                timestamp: Date.now(),
+                direction: 'sent',
+                stream_id: streamId,
+            };
+            addMessageToChat(state.activeChat, message);
+            contact.lastMessage = message;
+
+            input.value = '';
+            input.style.height = 'auto';
+            updateContactsList();
+            renderMessages();
+            return;
+        }
+
         const { nonce, ciphertext } = encrypt(contact.sessionKey, plaintext);
 
         const messageId = await sendMessageToServer(
@@ -1208,13 +1640,15 @@ window.sendMessage = async function() {
             id: messageId,  // Use server-generated ID for read receipt matching
             from: state.wallet,
             to: state.activeChat,
-            content,
+            content: finalContent,
             timestamp: Date.now(),
             direction: 'sent',
+            file: fileData,  // Include file data for rendering
+            text: content,   // Include original text
         };
 
         addMessageToChat(state.activeChat, message);
-        contact.lastMessage = message;
+        contact.lastMessage = { ...message, content: content || (fileData ? `📎 ${fileData.originalName}` : '') };
 
         input.value = '';
         input.style.height = 'auto';

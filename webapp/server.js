@@ -2,10 +2,11 @@
 import express from 'express';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, existsSync, mkdirSync, unlinkSync } from 'fs';
 import { createServer } from 'https';
 import { ed25519 } from '@noble/curves/ed25519';
 import Database from 'better-sqlite3';
+import multer from 'multer';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -17,6 +18,23 @@ const TLS_KEY = process.env.TLS_KEY || '/tmp/xchat-key.pem';
 // SQLite database
 const db = new Database(join(__dirname, 'data', 'messages.db'));
 db.pragma('journal_mode = WAL');
+
+// File upload setup
+const UPLOAD_DIR = join(__dirname, 'data', 'files');
+mkdirSync(UPLOAD_DIR, { recursive: true });
+
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+    filename: (req, file, cb) => {
+        const uniqueId = Date.now().toString(36) + Math.random().toString(36).slice(2);
+        cb(null, uniqueId);
+    }
+});
+
+const upload = multer({
+    storage,
+    limits: { fileSize: 50 * 1024 * 1024 } // 50MB max
+});
 
 // Create tables
 db.exec(`
@@ -33,11 +51,24 @@ db.exec(`
         nonce TEXT NOT NULL,
         ciphertext TEXT NOT NULL,
         created_at INTEGER NOT NULL,
-        read_at INTEGER DEFAULT NULL
+        read_at INTEGER DEFAULT NULL,
+        stream_id TEXT DEFAULT NULL,
+        chunk_index INTEGER DEFAULT NULL,
+        chunk_total INTEGER DEFAULT NULL,
+        is_final BOOLEAN DEFAULT NULL
     );
 
     CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient, created_at);
     CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender);
+
+    CREATE TABLE IF NOT EXISTS files (
+        id TEXT PRIMARY KEY,
+        uploader TEXT NOT NULL,
+        original_name TEXT NOT NULL,
+        mime_type TEXT,
+        size INTEGER,
+        created_at INTEGER DEFAULT (strftime('%s', 'now') * 1000)
+    );
 `);
 
 // Add read_at column if it doesn't exist (migration for existing DBs)
@@ -47,13 +78,20 @@ try {
     // Column already exists
 }
 
+// Add streaming columns if they don't exist
+try { db.exec('ALTER TABLE messages ADD COLUMN stream_id TEXT DEFAULT NULL'); } catch (e) {}
+try { db.exec('ALTER TABLE messages ADD COLUMN chunk_index INTEGER DEFAULT NULL'); } catch (e) {}
+try { db.exec('ALTER TABLE messages ADD COLUMN chunk_total INTEGER DEFAULT NULL'); } catch (e) {}
+try { db.exec('ALTER TABLE messages ADD COLUMN is_final BOOLEAN DEFAULT NULL'); } catch (e) {}
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_messages_stream_id ON messages(stream_id)'); } catch (e) {}
+
 // Prepared statements
 const stmts = {
     getKey: db.prepare('SELECT x25519_public_key FROM keys WHERE address = ?'),
     setKey: db.prepare('INSERT OR REPLACE INTO keys (address, x25519_public_key) VALUES (?, ?)'),
     getAllKeys: db.prepare('SELECT address, x25519_public_key FROM keys'),
 
-    insertMessage: db.prepare('INSERT INTO messages (id, sender, recipient, nonce, ciphertext, created_at) VALUES (?, ?, ?, ?, ?, ?)'),
+    insertMessage: db.prepare('INSERT INTO messages (id, sender, recipient, nonce, ciphertext, created_at, stream_id, chunk_index, chunk_total, is_final) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'),
     getMessages: db.prepare('SELECT * FROM messages WHERE recipient = ? AND created_at > ? ORDER BY created_at ASC'),
     getUserMessages: db.prepare('SELECT * FROM messages WHERE sender = ? OR recipient = ? ORDER BY created_at ASC'),
     getUserMessagesSince: db.prepare('SELECT * FROM messages WHERE (sender = ? OR recipient = ?) AND created_at > ? ORDER BY created_at ASC'),
@@ -61,6 +99,10 @@ const stmts = {
     getAllMessages: db.prepare('SELECT * FROM messages ORDER BY created_at ASC'),
     markMessagesRead: db.prepare('UPDATE messages SET read_at = ? WHERE id IN (SELECT value FROM json_each(?)) AND recipient = ? AND read_at IS NULL'),
     getMessageById: db.prepare('SELECT * FROM messages WHERE id = ?'),
+
+    // File statements
+    insertFile: db.prepare('INSERT INTO files (id, uploader, original_name, mime_type, size, created_at) VALUES (?, ?, ?, ?, ?, ?)'),
+    getFile: db.prepare('SELECT * FROM files WHERE id = ?'),
 };
 
 // SSE clients (in-memory, not persisted)
@@ -221,9 +263,22 @@ app.get('/api/stream/:address', (req, res) => {
     // Send only messages newer than 'since'
     let readCount = 0;
     for (const r of rows) {
-        const msg = { id: r.id, from: r.sender, to: r.recipient, nonce: r.nonce, ciphertext: r.ciphertext, timestamp: r.created_at, readAt: r.read_at || null };
+        const msg = {
+            id: r.id,
+            from: r.sender,
+            to: r.recipient,
+            nonce: r.nonce,
+            ciphertext: r.ciphertext,
+            timestamp: r.created_at,
+            readAt: r.read_at || null,
+            stream_id: r.stream_id || null,
+            chunk_index: r.chunk_index ?? null,
+            chunk_total: r.chunk_total ?? null,
+            is_final: r.is_final ?? null,
+        };
         if (r.read_at) readCount++;
-        res.write(`data: ${JSON.stringify({ type: 'message', message: msg })}\n\n`);
+        const eventType = r.stream_id ? 'stream_chunk' : 'message';
+        res.write(`data: ${JSON.stringify({ type: eventType, message: msg })}\n\n`);
     }
     console.log(`[SSE] Sent ${rows.length} messages, ${readCount} with readAt`);
 
@@ -264,7 +319,7 @@ app.post('/api/typing', (req, res) => {
 });
 
 app.post('/api/messages', (req, res) => {
-    const { from, to, nonce, ciphertext } = req.body;
+    const { from, to, nonce, ciphertext, stream_id, chunk_index, chunk_total, is_final } = req.body;
     if (!from || !to || !nonce || !ciphertext) {
         return res.status(400).json({ error: 'Missing fields' });
     }
@@ -272,16 +327,34 @@ app.post('/api/messages', (req, res) => {
     const message = {
         id: Date.now().toString(36) + Math.random().toString(36).slice(2),
         from, to, nonce, ciphertext,
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        stream_id: stream_id ?? null,
+        chunk_index: Number.isFinite(Number(chunk_index)) ? Number(chunk_index) : null,
+        chunk_total: Number.isFinite(Number(chunk_total)) ? Number(chunk_total) : null,
+        is_final: typeof is_final === 'boolean' ? (is_final ? 1 : 0) : null,
+        readAt: null,
     };
 
     // Store message in SQLite
-    stmts.insertMessage.run(message.id, from, to, nonce, ciphertext, message.timestamp);
+    stmts.insertMessage.run(
+        message.id,
+        from,
+        to,
+        nonce,
+        ciphertext,
+        message.timestamp,
+        message.stream_id,
+        message.chunk_index,
+        message.chunk_total,
+        message.is_final
+    );
+
+    const eventType = message.stream_id ? 'stream_chunk' : 'message';
 
     // Push to connected SSE clients
     const clients = sseClients.get(to);
     if (clients && clients.size > 0) {
-        const data = JSON.stringify({ type: 'message', message });
+        const data = JSON.stringify({ type: eventType, message });
         for (const client of clients) {
             client.write(`data: ${data}\n\n`);
         }
@@ -343,7 +416,11 @@ app.get('/api/messages/:address', (req, res) => {
         nonce: r.nonce,
         ciphertext: r.ciphertext,
         timestamp: r.created_at,
-        readAt: r.read_at || null
+        readAt: r.read_at || null,
+        stream_id: r.stream_id || null,
+        chunk_index: r.chunk_index ?? null,
+        chunk_total: r.chunk_total ?? null,
+        is_final: r.is_final ?? null
     }));
     res.json({ messages });
 });
@@ -391,6 +468,99 @@ app.delete('/api/messages/:address', (req, res) => {
 });
 
 // ============================================================================
+// FILE UPLOAD/DOWNLOAD
+// ============================================================================
+
+app.post('/api/files', upload.single('file'), (req, res) => {
+    if (!req.file) {
+        return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    const uploader = req.body.uploader;
+    if (!uploader) {
+        // Clean up uploaded file
+        try { unlinkSync(join(UPLOAD_DIR, req.file.filename)); } catch (e) {}
+        return res.status(400).json({ error: 'Missing uploader address' });
+    }
+
+    const fileId = req.file.filename;
+    const now = Date.now();
+
+    try {
+        stmts.insertFile.run(
+            fileId,
+            uploader,
+            req.file.originalname,
+            req.file.mimetype || 'application/octet-stream',
+            req.file.size,
+            now
+        );
+
+        console.log(`[File] Uploaded: ${fileId} (${req.file.originalname}, ${req.file.size} bytes) by ${uploader.slice(0, 8)}...`);
+
+        res.json({
+            success: true,
+            fileId,
+            originalName: req.file.originalname,
+            mimeType: req.file.mimetype,
+            size: req.file.size
+        });
+    } catch (e) {
+        console.error('[File] Upload error:', e);
+        try { unlinkSync(join(UPLOAD_DIR, req.file.filename)); } catch (e) {}
+        res.status(500).json({ error: 'Upload failed' });
+    }
+});
+
+app.get('/api/files/:fileId', (req, res) => {
+    const fileId = req.params.fileId;
+
+    // Validate fileId format (prevent directory traversal)
+    if (!/^[a-z0-9]+$/i.test(fileId)) {
+        return res.status(400).json({ error: 'Invalid file ID' });
+    }
+
+    const fileRecord = stmts.getFile.get(fileId);
+    if (!fileRecord) {
+        return res.status(404).json({ error: 'File not found' });
+    }
+
+    const filePath = join(UPLOAD_DIR, fileId);
+    if (!existsSync(filePath)) {
+        return res.status(404).json({ error: 'File not found on disk' });
+    }
+
+    // Set appropriate headers
+    res.setHeader('Content-Type', fileRecord.mime_type || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `inline; filename="${fileRecord.original_name}"`);
+    res.setHeader('Content-Length', fileRecord.size);
+
+    res.sendFile(filePath);
+});
+
+// Get file metadata (without downloading)
+app.get('/api/files/:fileId/info', (req, res) => {
+    const fileId = req.params.fileId;
+
+    if (!/^[a-z0-9]+$/i.test(fileId)) {
+        return res.status(400).json({ error: 'Invalid file ID' });
+    }
+
+    const fileRecord = stmts.getFile.get(fileId);
+    if (!fileRecord) {
+        return res.status(404).json({ error: 'File not found' });
+    }
+
+    res.json({
+        id: fileRecord.id,
+        originalName: fileRecord.original_name,
+        mimeType: fileRecord.mime_type,
+        size: fileRecord.size,
+        uploadedAt: fileRecord.created_at
+    });
+});
+
+// ============================================================================
 // DEBUG
 // ============================================================================
 
@@ -401,7 +571,11 @@ app.get('/api/debug/dump', (req, res) => {
         keys: keys.reduce((acc, r) => { acc[r.address] = r.x25519_public_key; return acc; }, {}),
         messages: messages.map(r => ({
             id: r.id, from: r.sender, to: r.recipient,
-            nonce: r.nonce, ciphertext: r.ciphertext, timestamp: r.created_at
+            nonce: r.nonce, ciphertext: r.ciphertext, timestamp: r.created_at,
+            stream_id: r.stream_id || null,
+            chunk_index: r.chunk_index ?? null,
+            chunk_total: r.chunk_total ?? null,
+            is_final: r.is_final ?? null
         })),
         sseClients: Object.fromEntries([...sseClients.entries()].map(([k, v]) => [k, v.size]))
     };
