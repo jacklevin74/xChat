@@ -1075,6 +1075,39 @@
         }
 
         /* Responsive */
+        /* Large desktop */
+        @media (min-width: 1600px) {
+            .sidebar {
+                width: 400px;
+                min-width: 360px;
+            }
+            .messages-container {
+                max-width: 1100px;
+                padding: 24px 40px;
+            }
+            .input-wrapper {
+                max-width: 1100px;
+            }
+            .input-area {
+                padding: 12px 40px 28px;
+            }
+        }
+
+        /* Desktop */
+        @media (min-width: 1200px) and (max-width: 1599px) {
+            .sidebar {
+                width: 360px;
+                min-width: 320px;
+            }
+            .messages-container {
+                max-width: 960px;
+                padding: 24px 32px;
+            }
+            .input-area {
+                padding: 12px 32px 24px;
+            }
+        }
+
         /* Tablet: shrink sidebar but keep text */
         @media (max-width: 900px) {
             .sidebar {
