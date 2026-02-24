@@ -1412,9 +1412,6 @@ const ctxMenu = {
 function initContextMenu() {
     ctxMenu.el = document.getElementById('msgContextMenu');
     if (!ctxMenu.el) return;
-    // Move into messages container so position:absolute is relative to it
-    const container = document.getElementById('messagesContainer');
-    if (container) container.appendChild(ctxMenu.el);
 
     // Emoji reactions
     ctxMenu.el.querySelectorAll('.ctx-emoji').forEach(btn => {
@@ -1453,24 +1450,23 @@ function showCtxMenu(msgEl, msgId, msgText) {
 
     ctxMenu.el.style.display = 'block';
 
-    // Position relative to the message element inside the scrollable container
-    const container = document.getElementById('messagesContainer');
-    const containerRect = container.getBoundingClientRect();
+    // Use live getBoundingClientRect — correct even mid-scroll
     const msgRect = msgEl.getBoundingClientRect();
     const menuW = ctxMenu.el.offsetWidth || 170;
     const menuH = ctxMenu.el.offsetHeight || 120;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
 
-    // Default: just above the message, aligned to its left edge
-    let top  = msgRect.top  - containerRect.top + container.scrollTop - menuH - 4;
-    let left = msgRect.left - containerRect.left;
+    // Show above the message by default, flip below if too close to top
+    let top  = msgRect.top - menuH - 6;
+    if (top < 8) top = msgRect.bottom + 6;
 
-    // If would go above container top, show below instead
-    if (top < container.scrollTop) {
-        top = msgRect.bottom - containerRect.top + container.scrollTop + 4;
-    }
-    // Keep within horizontal bounds
-    const maxLeft = container.clientWidth - menuW - 8;
-    left = Math.max(8, Math.min(left, maxLeft));
+    // Align to message left, clamp to viewport
+    let left = msgRect.left;
+    left = Math.max(8, Math.min(left, vw - menuW - 8));
+
+    // Clamp top too
+    top = Math.max(8, Math.min(top, vh - menuH - 8));
 
     ctxMenu.el.style.top  = top  + 'px';
     ctxMenu.el.style.left = left + 'px';
