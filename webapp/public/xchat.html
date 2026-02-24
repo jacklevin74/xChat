@@ -871,6 +871,58 @@
             background: #16a34a;
         }
 
+        .modal-actions .danger-btn {
+            background: #e53e3e;
+            border: none;
+            color: #fff;
+        }
+
+        .modal-actions .danger-btn:hover {
+            background: #c53030;
+        }
+
+        .delete-modal-options {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            margin: 8px 0 4px;
+        }
+
+        .delete-option {
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+            padding: 12px 14px;
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+
+        .delete-option:hover {
+            background: var(--bg-hover);
+        }
+
+        .delete-option.danger:hover {
+            background: rgba(229,62,62,0.08);
+            border-color: #e53e3e44;
+        }
+
+        .delete-option-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .delete-option.danger .delete-option-title {
+            color: #e53e3e;
+        }
+
+        .delete-option-desc {
+            font-size: 11px;
+            color: var(--text-secondary);
+        }
+
         /* Toast */
         .toast-container {
             position: fixed;
@@ -1231,7 +1283,7 @@
                                 <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
                             </svg>
                         </button>
-                        <button onclick="deleteConversation()" title="Delete conversation">
+                        <button onclick="openDeleteConvModal()" title="Delete conversation">
                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/>
                             </svg>
@@ -1336,6 +1388,26 @@
             <div class="modal-actions">
                 <button class="cancel-btn" onclick="closeNewChatModal()">Cancel</button>
                 <button class="confirm-btn" onclick="startNewChat()">Start Chat</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Delete Conversation Modal -->
+    <div class="modal-overlay hidden" id="deleteConvModal">
+        <div class="modal">
+            <h3>Delete Conversation</h3>
+            <div class="delete-modal-options">
+                <div class="delete-option" onclick="deleteForMe()">
+                    <span class="delete-option-title">Delete for me</span>
+                    <span class="delete-option-desc">Clears this conversation from your view only. The other person's copy is unaffected.</span>
+                </div>
+                <div class="delete-option danger" onclick="deleteForBoth()">
+                    <span class="delete-option-title">Delete for both</span>
+                    <span class="delete-option-desc">Permanently removes all messages between you and this contact from the server. Requires wallet signature.</span>
+                </div>
+            </div>
+            <div class="modal-actions">
+                <button class="cancel-btn" onclick="closeDeleteConvModal()">Cancel</button>
             </div>
         </div>
     </div>

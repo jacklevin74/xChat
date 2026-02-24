@@ -1622,16 +1622,49 @@ function updateWalletDisplay() {
     }
 }
 
-window.deleteConversation = async function() {
-    if (!state.wallet) { showToast('Not connected', 'error'); return; }
+// ============================================================================
+// DELETE CONVERSATION - Modal + two modes
+// ============================================================================
+
+window.openDeleteConvModal = function() {
+    if (!state.activeChat) return;
+    document.getElementById('deleteConvModal').classList.remove('hidden');
+};
+
+window.closeDeleteConvModal = function() {
+    document.getElementById('deleteConvModal').classList.add('hidden');
+};
+
+// Delete for me only — no server call, no signature needed
+window.deleteForMe = function() {
+    closeDeleteConvModal();
+    if (!state.activeChat) return;
+    const peer = state.activeChat;
+    state.messages.delete(peer);
+    const contact = state.contacts.get(peer);
+    if (contact) { contact.lastMessage = null; contact.unread = 0; }
+    state.activeChat = null;
+    updateContactsList();
+    renderMessages();
+    showToast('Conversation cleared', 'success');
+};
+
+// Delete for both — signed server request scoped to this conversation
+window.deleteForBoth = async function() {
+    closeDeleteConvModal();
+    if (!state.wallet || !state.activeChat) return;
+
     // Re-acquire provider if lost after auto-reconnect
     if (!state.walletProvider) {
         state.walletProvider = window.x1Wallet || window.x1 || window.x1_wallet ||
                                window.backpack || window.phantom?.solana || window.solana;
     }
-    if (!state.walletProvider) { showToast('Wallet provider missing — please reconnect', 'error'); return; }
+    if (!state.walletProvider) {
+        showToast('Wallet provider missing — please reconnect', 'error');
+        return;
+    }
 
-    if (!confirm('Delete all messages in this conversation? This cannot be undone.')) return;
+    const peer = state.activeChat;
 
     try {
         const messageText = `X1 Messaging: Delete my message history`;
@@ -1641,32 +1674,34 @@ window.deleteConversation = async function() {
         let signatureBytes;
         try {
             const result = await state.walletProvider.signMessage(messageBytes, 'utf8');
-            // Different wallets return signature differently
             signatureBytes = result.signature || result;
             if (!(signatureBytes instanceof Uint8Array)) {
                 signatureBytes = new Uint8Array(Object.values(signatureBytes));
             }
         } catch (e) {
-            if (e.message?.includes('User rejected') || e.code === 4001) return;
+            if (e.message?.includes('User rejected') || e.code === 4001) {
+                showToast('Cancelled', 'info');
+                return;
+            }
             throw e;
         }
 
         const res = await fetch(`${API_BASE}/api/messages/${encodeURIComponent(state.wallet)}`, {
             method: 'DELETE',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ signature: base58Encode(signatureBytes) })
+            body: JSON.stringify({ signature: base58Encode(signatureBytes), peer })
         });
 
         const data = await res.json().catch(() => ({}));
 
         if (res.ok) {
-            // Clear local state
-            state.messages.delete(state.activeChat);
-            state.contacts.forEach(c => { c.lastMessage = null; c.unread = 0; });
+            state.messages.delete(peer);
+            const contact = state.contacts.get(peer);
+            if (contact) { contact.lastMessage = null; contact.unread = 0; }
             state.activeChat = null;
             updateContactsList();
             renderMessages();
-            showToast(`Deleted ${data.deleted || 0} messages`, 'success');
+            showToast(`Deleted ${data.deleted || 0} messages for both`, 'success');
         } else {
             console.error('[Delete] Server error:', data);
             showToast(`Delete failed: ${data.error || res.status}`, 'error');

@@ -69,6 +69,7 @@ const stmts = {
     getUserMessages: db.prepare('SELECT * FROM messages WHERE sender = ? OR recipient = ? ORDER BY created_at ASC'),
     getUserMessagesSince: db.prepare('SELECT * FROM messages WHERE (sender = ? OR recipient = ?) AND created_at > ? ORDER BY created_at ASC'),
     deleteUserMessages: db.prepare('DELETE FROM messages WHERE sender = ? OR recipient = ?'),
+    deleteConversation: db.prepare('DELETE FROM messages WHERE (sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?)'),
     getAllMessages: db.prepare('SELECT * FROM messages ORDER BY created_at ASC'),
     markMessagesRead: db.prepare('UPDATE messages SET read_at = ? WHERE id IN (SELECT value FROM json_each(?)) AND recipient = ? AND read_at IS NULL'),
     getMessageById: db.prepare('SELECT * FROM messages WHERE id = ?'),
@@ -430,11 +431,20 @@ app.delete('/api/messages/:address', (req, res) => {
             return res.status(401).json({ error: 'Invalid signature' });
         }
 
-        // Delete messages where this address is sender OR recipient
-        const result = stmts.deleteUserMessages.run(address, address);
-        const deletedCount = result.changes;
-
-        console.log(`[Msg] Deleted ${deletedCount} messages for ${address.slice(0, 8)}...`);
+        // If peer provided, delete only that conversation; otherwise delete all
+        const { peer } = req.body;
+        let deletedCount;
+        if (peer && typeof peer === 'string') {
+            const peerKey = base58Decode(peer);
+            if (peerKey.length !== 32) return res.status(400).json({ error: 'Invalid peer address' });
+            const result = stmts.deleteConversation.run(address, peer, peer, address);
+            deletedCount = result.changes;
+            console.log(`[Msg] Deleted ${deletedCount} messages between ${address.slice(0,8)}... and ${peer.slice(0,8)}...`);
+        } else {
+            const result = stmts.deleteUserMessages.run(address, address);
+            deletedCount = result.changes;
+            console.log(`[Msg] Deleted ${deletedCount} messages for ${address.slice(0,8)}...`);
+        }
         res.json({ success: true, deleted: deletedCount });
 
     } catch (e) {
