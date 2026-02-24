@@ -1493,13 +1493,30 @@ async function uploadFile(file) {
     const progressFill = document.getElementById('uploadProgressFill');
     const progressText = document.getElementById('uploadProgressText');
 
-    // Need an active chat to know who the recipient is
-    if (!state.activeChat) throw new Error('No active chat');
+    // Debug: log state at upload time
+    console.log('[Upload] state.activeChat:', state.activeChat);
+    console.log('[Upload] state.privateKey:', state.privateKey ? 'SET' : 'NULL');
     const contact = state.contacts.get(state.activeChat);
-    if (!contact?.publicKey) throw new Error('Recipient public key not found');
+    console.log('[Upload] contact:', contact ? `publicKey=${contact.publicKey ? 'SET' : 'NULL'} sessionKey=${contact.sessionKey ? 'SET' : 'NULL'}` : 'NOT FOUND');
+
+    // Need an active chat to know who the recipient is
+    if (!state.activeChat) {
+        showToast('❌ Upload failed: no active chat', 'error');
+        throw new Error('No active chat');
+    }
+    if (!contact?.publicKey) {
+        showToast('❌ Upload failed: recipient public key not found', 'error');
+        throw new Error('Recipient public key not found');
+    }
+    if (!state.privateKey) {
+        showToast('❌ Upload failed: wallet not connected', 'error');
+        throw new Error('Wallet not connected');
+    }
 
     fileState.uploading = true;
     progressBar.classList.add('visible');
+    progressText.textContent = 'Starting upload…';
+    progressFill.style.width = '0%';
 
     try {
         const attachment = await encryptAndUpload(
@@ -1509,16 +1526,28 @@ async function uploadFile(file) {
             ({ pct, msg }) => {
                 progressFill.style.width = pct + '%';
                 progressText.textContent = msg;
+                console.log(`[Upload] ${pct}% — ${msg}`);
             }
         );
 
         fileState.uploading = false;
-        progressBar.classList.remove('visible');
+        progressFill.style.width = '100%';
+        progressText.textContent = `✅ Uploaded to IPFS — CID: ${attachment.cid}`;
+        console.log('[Upload] ✅ Success! CID:', attachment.cid);
+        // Keep success message visible briefly before hiding
+        setTimeout(() => progressBar.classList.remove('visible'), 3000);
         return attachment;   // xchat-file-v1 payload — goes into message JSON
 
     } catch (e) {
         fileState.uploading = false;
-        progressBar.classList.remove('visible');
+        progressFill.style.width = '100%';
+        progressFill.style.background = '#e53e3e';
+        progressText.textContent = `❌ Upload failed: ${e.message}`;
+        console.error('[Upload] ❌ Failed:', e);
+        setTimeout(() => {
+            progressBar.classList.remove('visible');
+            progressFill.style.background = '';
+        }, 5000);
         throw e;
     }
 }
