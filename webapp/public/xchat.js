@@ -741,6 +741,11 @@ function saveWalletState(address) {
     const contactsClean = new Map(
         [...state.contacts].map(([k, v]) => [k, { publicKey: v.publicKey, sessionKey: null, lastMessage: v.lastMessage, unread: v.unread }])
     );
+    // Persist reactions: Map<msgId, Map<emoji, count>> → plain object
+    const reactionsObj = {};
+    messageReactions.forEach((emojiMap, msgId) => {
+        reactionsObj[msgId] = Object.fromEntries(emojiMap);
+    });
     walletStates.set(address, {
         contacts: contactsClean,
         messages: new Map([...state.messages].map(([k, v]) => [k, [...v]])),
@@ -749,13 +754,27 @@ function saveWalletState(address) {
         historyLoaded: state.historyLoaded,
         lastSyncTimestamp: state.lastSyncTimestamp,
         readMessageIds: new Set(state.readMessageIds),
+        reactions: reactionsObj,
         // pendingContacts and incomingStreams are transient — don't restore them
     });
+    // Also persist to localStorage so reactions survive full page reload
+    try {
+        localStorage.setItem(`x1msg-reactions-${address}`, JSON.stringify(reactionsObj));
+    } catch (e) { /* quota exceeded — ignore */ }
 }
 
 // Restore a previously saved wallet context, or initialise a clean slate.
 function loadWalletState(address) {
     const saved = walletStates.get(address);
+
+    // Restore reactions from walletStates or localStorage
+    messageReactions.clear();
+    const reactionsObj = saved?.reactions
+        || JSON.parse(localStorage.getItem(`x1msg-reactions-${address}`) || '{}');
+    Object.entries(reactionsObj).forEach(([msgId, emojiMap]) => {
+        messageReactions.set(msgId, new Map(Object.entries(emojiMap).map(([e, c]) => [e, Number(c)])));
+    });
+
     if (saved) {
         state.contacts       = saved.contacts;
         state.messages       = saved.messages;
@@ -1168,17 +1187,13 @@ function renderMessages() {
             // Right-click
             el.addEventListener('contextmenu', (e) => {
                 e.preventDefault();
-                showCtxMenu(e.clientX, e.clientY, msgId, msgText);
+                showCtxMenu(el, msgId, msgText);
             });
 
             // Long-press for mobile
             let pressTimer;
             el.addEventListener('pointerdown', () => {
-                pressTimer = setTimeout(() => showCtxMenu(
-                    el.getBoundingClientRect().left,
-                    el.getBoundingClientRect().top,
-                    msgId, msgText
-                ), 500);
+                pressTimer = setTimeout(() => showCtxMenu(el, msgId, msgText), 500);
             });
             el.addEventListener('pointerup', () => clearTimeout(pressTimer));
             el.addEventListener('pointermove', () => clearTimeout(pressTimer));
@@ -1397,6 +1412,9 @@ const ctxMenu = {
 function initContextMenu() {
     ctxMenu.el = document.getElementById('msgContextMenu');
     if (!ctxMenu.el) return;
+    // Move into messages container so position:absolute is relative to it
+    const container = document.getElementById('messagesContainer');
+    if (container) container.appendChild(ctxMenu.el);
 
     // Emoji reactions
     ctxMenu.el.querySelectorAll('.ctx-emoji').forEach(btn => {
@@ -1428,17 +1446,34 @@ function initContextMenu() {
     });
 }
 
-function showCtxMenu(x, y, msgId, msgText) {
+function showCtxMenu(msgEl, msgId, msgText) {
     if (!ctxMenu.el) return;
     ctxMenu.msgId = msgId;
     ctxMenu.msgText = msgText;
 
-    // Position — keep inside viewport
     ctxMenu.el.style.display = 'block';
-    const rect = ctxMenu.el.getBoundingClientRect();
-    const vw = window.innerWidth, vh = window.innerHeight;
-    ctxMenu.el.style.left = Math.min(x, vw - rect.width - 8) + 'px';
-    ctxMenu.el.style.top  = Math.min(y, vh - rect.height - 8) + 'px';
+
+    // Position relative to the message element inside the scrollable container
+    const container = document.getElementById('messagesContainer');
+    const containerRect = container.getBoundingClientRect();
+    const msgRect = msgEl.getBoundingClientRect();
+    const menuW = ctxMenu.el.offsetWidth || 170;
+    const menuH = ctxMenu.el.offsetHeight || 120;
+
+    // Default: just above the message, aligned to its left edge
+    let top  = msgRect.top  - containerRect.top + container.scrollTop - menuH - 4;
+    let left = msgRect.left - containerRect.left;
+
+    // If would go above container top, show below instead
+    if (top < container.scrollTop) {
+        top = msgRect.bottom - containerRect.top + container.scrollTop + 4;
+    }
+    // Keep within horizontal bounds
+    const maxLeft = container.clientWidth - menuW - 8;
+    left = Math.max(8, Math.min(left, maxLeft));
+
+    ctxMenu.el.style.top  = top  + 'px';
+    ctxMenu.el.style.left = left + 'px';
 }
 
 function hideCtxMenu() {
@@ -1518,7 +1553,12 @@ function updateWalletDisplay() {
 
 window.deleteConversation = async function() {
     if (!state.wallet) { showToast('Not connected', 'error'); return; }
-    if (!state.walletProvider) { showToast('Wallet provider missing', 'error'); return; }
+    // Re-acquire provider if lost after auto-reconnect
+    if (!state.walletProvider) {
+        state.walletProvider = window.x1Wallet || window.x1 || window.x1_wallet ||
+                               window.backpack || window.phantom?.solana || window.solana;
+    }
+    if (!state.walletProvider) { showToast('Wallet provider missing — please reconnect', 'error'); return; }
 
     if (!confirm('Delete all messages in this conversation? This cannot be undone.')) return;
 
