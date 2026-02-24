@@ -1529,10 +1529,11 @@ function renderFileAttachment(fileData, direction, contactAddress) {
     // Legacy local files still use the old URL
     const fileUrl = isIPFS ? null : `${API_BASE}/api/files/${fileData.fileId}`;
 
-    if (isImageMimeType(mimeType)) {
+    // Legacy local image preview (non-IPFS only — IPFS images need decrypt first)
+    if (!isIPFS && isImageMimeType(mime)) {
         return `
             <a href="${fileUrl}" target="_blank" rel="noopener">
-                <img src="${fileUrl}" alt="${escapeHtml(originalName)}" class="message-file-image" 
+                <img src="${fileUrl}" alt="${escapeHtml(name)}" class="message-file-image" 
                      onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
                 <div class="message-file" style="display: none;">
                     <div class="message-file-icon">
@@ -1543,7 +1544,7 @@ function renderFileAttachment(fileData, direction, contactAddress) {
                         </svg>
                     </div>
                     <div class="message-file-info">
-                        <div class="message-file-name">${escapeHtml(originalName)}</div>
+                        <div class="message-file-name">${escapeHtml(name)}</div>
                         <div class="message-file-size">${formatFileSize(size)}</div>
                     </div>
                 </div>
@@ -1554,6 +1555,33 @@ function renderFileAttachment(fileData, direction, contactAddress) {
     // ── IPFS E2E encrypted file ──────────────────────────────────────────────
     if (isIPFS) {
         const attachId = 'ipfs-' + cid.slice(0, 8);
+
+        // Pick icon SVG based on mime type
+        const isVideo = mime && mime.startsWith('video/');
+        const isImg   = mime && mime.startsWith('image/');
+        const isAudio = mime && mime.startsWith('audio/');
+        const iconSvg = isVideo
+            ? `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="2" y="7" width="15" height="10" rx="2" ry="2"/>
+                <path d="M17 9l5-3v12l-5-3V9z"/>
+               </svg>`
+            : isImg
+            ? `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+                <circle cx="8.5" cy="8.5" r="1.5"/>
+                <path d="M21 15l-5-5L5 21"/>
+               </svg>`
+            : isAudio
+            ? `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>
+               </svg>`
+            : `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+                <path d="M7 11V7a5 5 0 0110 0v4"/>
+               </svg>`;
+
+        const typeLabel = isVideo ? '🎬 video' : isImg ? '🖼 image' : isAudio ? '🎵 audio' : '📎 file';
+
         // Register a one-time click handler for decrypt+download
         setTimeout(() => {
             const el = document.getElementById(attachId);
@@ -1575,7 +1603,10 @@ function renderFileAttachment(fileData, direction, contactAddress) {
                     );
                     downloadFile(bytes, n, m);
                     el.style.opacity = '1';
-                    el.title = 'Downloaded!';
+                    el.title = 'Downloaded ✓';
+                    // Show a brief "saved" indicator
+                    const sizeEl = el.querySelector('.message-file-size');
+                    if (sizeEl) sizeEl.textContent = '✓ Saved to downloads';
                 } catch (e) {
                     showToast('Decrypt failed: ' + e.message, 'error');
                     el.style.opacity = '1';
@@ -1586,15 +1617,10 @@ function renderFileAttachment(fileData, direction, contactAddress) {
 
         return `
             <div id="${attachId}" class="message-file" style="cursor:pointer;" title="Click to decrypt & download">
-                <div class="message-file-icon">
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
-                        <path d="M7 11V7a5 5 0 0110 0v4"/>
-                    </svg>
-                </div>
+                <div class="message-file-icon">${iconSvg}</div>
                 <div class="message-file-info">
                     <div class="message-file-name">${escapeHtml(name)}</div>
-                    <div class="message-file-size">${formatFileSize(size)} · 🔐 E2E encrypted · IPFS</div>
+                    <div class="message-file-size">${formatFileSize(size)} · ${typeLabel} · 🔐 E2E · IPFS</div>
                 </div>
             </div>
         `;
@@ -1732,7 +1758,7 @@ window.sendMessage = async function() {
         };
 
         addMessageToChat(state.activeChat, message);
-        contact.lastMessage = { ...message, content: content || (fileData ? `📎 ${fileData.originalName}` : '') };
+        contact.lastMessage = { ...message, content: content || (fileData ? `📎 ${fileData.name || fileData.originalName || 'file'}` : '') };
 
         input.value = '';
         input.style.height = 'auto';
