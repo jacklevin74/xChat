@@ -767,13 +767,7 @@ function saveWalletState(address) {
 function loadWalletState(address) {
     const saved = walletStates.get(address);
 
-    // Restore reactions from walletStates or localStorage
-    messageReactions.clear();
-    const reactionsObj = saved?.reactions
-        || JSON.parse(localStorage.getItem(`x1msg-reactions-${address}`) || '{}');
-    Object.entries(reactionsObj).forEach(([msgId, emojiMap]) => {
-        messageReactions.set(msgId, new Map(Object.entries(emojiMap).map(([e, c]) => [e, Number(c)])));
-    });
+    // Reactions are restored separately via restoreReactions()
 
     if (saved) {
         state.contacts       = saved.contacts;
@@ -1478,14 +1472,40 @@ function hideCtxMenu() {
     ctxMenu.msgText = null;
 }
 
-// Reactions stored in memory (per session)
+// Reactions stored in memory + localStorage
 const messageReactions = new Map(); // msgId → Map(emoji → count)
+
+function persistReactions() {
+    if (!state.wallet) return;
+    const obj = {};
+    messageReactions.forEach((emojiMap, msgId) => {
+        if (emojiMap.size > 0) obj[msgId] = Object.fromEntries(emojiMap);
+    });
+    try {
+        localStorage.setItem(`x1msg-reactions-${state.wallet}`, JSON.stringify(obj));
+    } catch (e) { /* quota */ }
+}
+
+function restoreReactions(wallet) {
+    messageReactions.clear();
+    try {
+        const raw = localStorage.getItem(`x1msg-reactions-${wallet}`);
+        if (!raw) return;
+        const obj = JSON.parse(raw);
+        Object.entries(obj).forEach(([msgId, emojiMap]) => {
+            messageReactions.set(msgId, new Map(
+                Object.entries(emojiMap).map(([e, c]) => [e, Number(c)])
+            ));
+        });
+    } catch (e) { /* corrupt data */ }
+}
 
 function addReaction(msgId, emoji) {
     if (!messageReactions.has(msgId)) messageReactions.set(msgId, new Map());
     const map = messageReactions.get(msgId);
     map.set(emoji, (map.get(emoji) || 0) + 1);
     renderReactions(msgId);
+    persistReactions();
 }
 
 function renderReactions(msgId) {
@@ -1510,6 +1530,7 @@ window.toggleReaction = function(msgId, emoji) {
     if (cur <= 1) map.delete(emoji);
     else map.set(emoji, cur - 1);
     renderReactions(msgId);
+    persistReactions();
 };
 
 function deleteMessage(msgId) {
@@ -2115,6 +2136,7 @@ window.connectWallet = async function() {
 
         // Restore this wallet's context (or initialise a clean slate)
         loadWalletState(walletAddress);
+        restoreReactions(walletAddress);
         loadReadMessages();
 
         // Check for cached signature
@@ -2265,6 +2287,7 @@ async function tryAutoReconnect() {
 
         // Restore any previously saved context for this wallet
         loadWalletState(cachedWallet);
+        restoreReactions(cachedWallet);
         loadReadMessages();
 
         document.getElementById('connectOverlay').classList.add('hidden');
