@@ -1157,6 +1157,33 @@ function renderMessages() {
 
         container.innerHTML = html;
 
+        // Re-render any existing reactions
+        messageReactions.forEach((_, msgId) => renderReactions(msgId));
+
+        // Attach right-click / long-press context menu to every message
+        container.querySelectorAll('.message[data-msg-id]').forEach(el => {
+            const msgId = el.dataset.msgId;
+            const msgText = el.querySelector('.message-content')?.textContent?.trim() || '';
+
+            // Right-click
+            el.addEventListener('contextmenu', (e) => {
+                e.preventDefault();
+                showCtxMenu(e.clientX, e.clientY, msgId, msgText);
+            });
+
+            // Long-press for mobile
+            let pressTimer;
+            el.addEventListener('pointerdown', () => {
+                pressTimer = setTimeout(() => showCtxMenu(
+                    el.getBoundingClientRect().left,
+                    el.getBoundingClientRect().top,
+                    msgId, msgText
+                ), 500);
+            });
+            el.addEventListener('pointerup', () => clearTimeout(pressTimer));
+            el.addEventListener('pointermove', () => clearTimeout(pressTimer));
+        });
+
         // Use requestAnimationFrame to ensure DOM is updated before scrolling
         requestAnimationFrame(() => {
             container.scrollTop = container.scrollHeight;
@@ -1261,7 +1288,17 @@ window.selectChat = function(address) {
         }
 
         const chatName = document.getElementById('chatName');
-        if (chatName) chatName.textContent = shortenAddress(address);
+        if (chatName) {
+            chatName.innerHTML = `
+                <span title="${address}" style="cursor:pointer;" onclick="copyAddress()">${shortenAddress(address)}</span>
+                <button onclick="copyAddress()" title="Copy full address" style="background:none;border:none;cursor:pointer;padding:0 4px;color:var(--text-muted);vertical-align:middle;line-height:1;">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                        <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
+                    </svg>
+                </button>
+            `;
+        }
 
         const chatStatus = document.getElementById('chatStatus');
         if (chatStatus) chatStatus.textContent = 'End-to-end encrypted';
@@ -1348,6 +1385,111 @@ window.copyAddress = function() {
         showToast('Address copied!', 'success');
     }
 };
+
+// ── Message context menu (right-click or long-press) ─────────────────────────
+
+const ctxMenu = {
+    el: null,
+    msgId: null,
+    msgText: null,
+};
+
+function initContextMenu() {
+    ctxMenu.el = document.getElementById('msgContextMenu');
+    if (!ctxMenu.el) return;
+
+    // Emoji reactions
+    ctxMenu.el.querySelectorAll('.ctx-emoji').forEach(btn => {
+        btn.addEventListener('click', () => {
+            if (!ctxMenu.msgId) return;
+            addReaction(ctxMenu.msgId, btn.dataset.emoji);
+            hideCtxMenu();
+        });
+    });
+
+    // Copy text
+    document.getElementById('ctxCopy').addEventListener('click', () => {
+        if (ctxMenu.msgText) {
+            navigator.clipboard.writeText(ctxMenu.msgText);
+            showToast('Copied!', 'success');
+        }
+        hideCtxMenu();
+    });
+
+    // Delete message
+    document.getElementById('ctxDelete').addEventListener('click', () => {
+        if (ctxMenu.msgId) deleteMessage(ctxMenu.msgId);
+        hideCtxMenu();
+    });
+
+    // Click outside → close
+    document.addEventListener('click', (e) => {
+        if (ctxMenu.el && !ctxMenu.el.contains(e.target)) hideCtxMenu();
+    });
+}
+
+function showCtxMenu(x, y, msgId, msgText) {
+    if (!ctxMenu.el) return;
+    ctxMenu.msgId = msgId;
+    ctxMenu.msgText = msgText;
+
+    // Position — keep inside viewport
+    ctxMenu.el.style.display = 'block';
+    const rect = ctxMenu.el.getBoundingClientRect();
+    const vw = window.innerWidth, vh = window.innerHeight;
+    ctxMenu.el.style.left = Math.min(x, vw - rect.width - 8) + 'px';
+    ctxMenu.el.style.top  = Math.min(y, vh - rect.height - 8) + 'px';
+}
+
+function hideCtxMenu() {
+    if (ctxMenu.el) ctxMenu.el.style.display = 'none';
+    ctxMenu.msgId = null;
+    ctxMenu.msgText = null;
+}
+
+// Reactions stored in memory (per session)
+const messageReactions = new Map(); // msgId → Map(emoji → count)
+
+function addReaction(msgId, emoji) {
+    if (!messageReactions.has(msgId)) messageReactions.set(msgId, new Map());
+    const map = messageReactions.get(msgId);
+    map.set(emoji, (map.get(emoji) || 0) + 1);
+    renderReactions(msgId);
+}
+
+function renderReactions(msgId) {
+    const msgEl = document.querySelector(`.message[data-msg-id="${msgId}"]`);
+    if (!msgEl) return;
+    let reactEl = msgEl.querySelector('.message-reactions');
+    if (!reactEl) {
+        reactEl = document.createElement('div');
+        reactEl.className = 'message-reactions';
+        msgEl.appendChild(reactEl);
+    }
+    const map = messageReactions.get(msgId) || new Map();
+    reactEl.innerHTML = [...map.entries()]
+        .map(([emoji, count]) => `<span class="reaction-badge" onclick="toggleReaction('${msgId}','${emoji}')">${emoji} ${count}</span>`)
+        .join('');
+}
+
+window.toggleReaction = function(msgId, emoji) {
+    const map = messageReactions.get(msgId);
+    if (!map) return;
+    const cur = map.get(emoji) || 0;
+    if (cur <= 1) map.delete(emoji);
+    else map.set(emoji, cur - 1);
+    renderReactions(msgId);
+};
+
+function deleteMessage(msgId) {
+    if (!state.activeChat) return;
+    const msgs = state.messages.get(state.activeChat);
+    if (!msgs) return;
+    const idx = msgs.findIndex(m => m.id === msgId);
+    if (idx !== -1) msgs.splice(idx, 1);
+    renderMessages();
+    showToast('Message deleted', 'success');
+}
 
 window.copyWalletAddress = function() {
     if (state.wallet) {
@@ -2078,6 +2220,7 @@ async function tryAutoReconnect() {
 
 document.addEventListener('DOMContentLoaded', () => {
     console.log('X1 Chat initialized');
+    initContextMenu();     // Message right-click menu + emoji reactions
     updateContactsList();  // Show demo contact immediately
     // Wait longer for wallet extensions to inject their providers
     const attemptReconnect = () => {

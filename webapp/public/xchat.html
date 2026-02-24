@@ -933,6 +933,27 @@
             background: var(--text-muted);
         }
 
+        /* Context menu */
+        #ctxCopy:hover { background: var(--bg-hover); }
+        #ctxDelete:hover { background: rgba(229,62,62,0.1); }
+        .ctx-emoji {
+            font-size: 20px; cursor: pointer; padding: 2px 4px;
+            border-radius: 6px; transition: transform 0.1s;
+        }
+        .ctx-emoji:hover { transform: scale(1.3); background: var(--bg-hover); }
+
+        /* Reaction badge on messages */
+        .message-reactions {
+            display: flex; gap: 4px; flex-wrap: wrap;
+            margin-top: 4px; width: 100%;
+        }
+        .reaction-badge {
+            background: var(--bg-secondary); border: 1px solid var(--border-color);
+            border-radius: 12px; padding: 2px 8px; font-size: 13px;
+            cursor: pointer; user-select: none;
+        }
+        .reaction-badge:hover { border-color: var(--blue); }
+
         /* Avatar colors based on address */
         .avatar-1 { background: var(--green-dim) !important; color: var(--green) !important; }
         .avatar-2 { background: var(--blue-dim) !important; color: var(--blue) !important; }
@@ -1279,6 +1300,32 @@
                     </div>
                 </div>
             </div>
+        </div>
+    </div>
+
+    <!-- Message Context Menu -->
+    <div id="msgContextMenu" style="
+        display:none; position:fixed; z-index:9999;
+        background:var(--bg-secondary); border:1px solid var(--border-color);
+        border-radius:10px; box-shadow:0 4px 20px rgba(0,0,0,0.4);
+        padding:6px; min-width:160px; font-size:13px;
+    ">
+        <div id="ctxEmojiRow" style="display:flex;gap:4px;padding:6px 8px;border-bottom:1px solid var(--border-color);margin-bottom:4px;">
+            <span class="ctx-emoji" data-emoji="👍">👍</span>
+            <span class="ctx-emoji" data-emoji="❤️">❤️</span>
+            <span class="ctx-emoji" data-emoji="😂">😂</span>
+            <span class="ctx-emoji" data-emoji="🔥">🔥</span>
+            <span class="ctx-emoji" data-emoji="😮">😮</span>
+            <span class="ctx-emoji" data-emoji="😢">😢</span>
+            <span class="ctx-emoji" data-emoji="🙏">🙏</span>
+        </div>
+        <div id="ctxCopy" style="padding:8px 12px;cursor:pointer;border-radius:6px;display:flex;align-items:center;gap:8px;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+            Copy text
+        </div>
+        <div id="ctxDelete" style="padding:8px 12px;cursor:pointer;border-radius:6px;color:#e53e3e;display:flex;align-items:center;gap:8px;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+            Delete message
         </div>
     </div>
 
