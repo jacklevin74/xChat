@@ -2,11 +2,10 @@
 import express from 'express';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
-import { readFileSync, existsSync, mkdirSync, unlinkSync } from 'fs';
+import { readFileSync, existsSync } from 'fs';
 import { createServer } from 'https';
 import { ed25519 } from '@noble/curves/ed25519';
 import Database from 'better-sqlite3';
-import multer from 'multer';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -18,23 +17,6 @@ const TLS_KEY = process.env.TLS_KEY || '/tmp/xchat-key.pem';
 // SQLite database
 const db = new Database(join(__dirname, 'data', 'messages.db'));
 db.pragma('journal_mode = WAL');
-
-// File upload setup
-const UPLOAD_DIR = join(__dirname, 'data', 'files');
-mkdirSync(UPLOAD_DIR, { recursive: true });
-
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, UPLOAD_DIR),
-    filename: (req, file, cb) => {
-        const uniqueId = Date.now().toString(36) + Math.random().toString(36).slice(2);
-        cb(null, uniqueId);
-    }
-});
-
-const upload = multer({
-    storage,
-    limits: { fileSize: 50 * 1024 * 1024 } // 50MB max
-});
 
 // Create tables
 db.exec(`
@@ -60,15 +42,6 @@ db.exec(`
 
     CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient, created_at);
     CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender);
-
-    CREATE TABLE IF NOT EXISTS files (
-        id TEXT PRIMARY KEY,
-        uploader TEXT NOT NULL,
-        original_name TEXT NOT NULL,
-        mime_type TEXT,
-        size INTEGER,
-        created_at INTEGER DEFAULT (strftime('%s', 'now') * 1000)
-    );
 `);
 
 // Add read_at column if it doesn't exist (migration for existing DBs)
@@ -99,10 +72,6 @@ const stmts = {
     getAllMessages: db.prepare('SELECT * FROM messages ORDER BY created_at ASC'),
     markMessagesRead: db.prepare('UPDATE messages SET read_at = ? WHERE id IN (SELECT value FROM json_each(?)) AND recipient = ? AND read_at IS NULL'),
     getMessageById: db.prepare('SELECT * FROM messages WHERE id = ?'),
-
-    // File statements
-    insertFile: db.prepare('INSERT INTO files (id, uploader, original_name, mime_type, size, created_at) VALUES (?, ?, ?, ?, ?, ?)'),
-    getFile: db.prepare('SELECT * FROM files WHERE id = ?'),
 };
 
 // SSE clients (in-memory, not persisted)
@@ -467,98 +436,9 @@ app.delete('/api/messages/:address', (req, res) => {
     }
 });
 
-// ============================================================================
-// FILE UPLOAD/DOWNLOAD
-// ============================================================================
-
-app.post('/api/files', upload.single('file'), (req, res) => {
-    if (!req.file) {
-        return res.status(400).json({ error: 'No file uploaded' });
-    }
-
-    const uploader = req.body.uploader;
-    if (!uploader) {
-        // Clean up uploaded file
-        try { unlinkSync(join(UPLOAD_DIR, req.file.filename)); } catch (e) {}
-        return res.status(400).json({ error: 'Missing uploader address' });
-    }
-
-    const fileId = req.file.filename;
-    const now = Date.now();
-
-    try {
-        stmts.insertFile.run(
-            fileId,
-            uploader,
-            req.file.originalname,
-            req.file.mimetype || 'application/octet-stream',
-            req.file.size,
-            now
-        );
-
-        console.log(`[File] Uploaded: ${fileId} (${req.file.originalname}, ${req.file.size} bytes) by ${uploader.slice(0, 8)}...`);
-
-        res.json({
-            success: true,
-            fileId,
-            originalName: req.file.originalname,
-            mimeType: req.file.mimetype,
-            size: req.file.size
-        });
-    } catch (e) {
-        console.error('[File] Upload error:', e);
-        try { unlinkSync(join(UPLOAD_DIR, req.file.filename)); } catch (e) {}
-        res.status(500).json({ error: 'Upload failed' });
-    }
-});
-
-app.get('/api/files/:fileId', (req, res) => {
-    const fileId = req.params.fileId;
-
-    // Validate fileId format (prevent directory traversal)
-    if (!/^[a-z0-9]+$/i.test(fileId)) {
-        return res.status(400).json({ error: 'Invalid file ID' });
-    }
-
-    const fileRecord = stmts.getFile.get(fileId);
-    if (!fileRecord) {
-        return res.status(404).json({ error: 'File not found' });
-    }
-
-    const filePath = join(UPLOAD_DIR, fileId);
-    if (!existsSync(filePath)) {
-        return res.status(404).json({ error: 'File not found on disk' });
-    }
-
-    // Set appropriate headers
-    res.setHeader('Content-Type', fileRecord.mime_type || 'application/octet-stream');
-    res.setHeader('Content-Disposition', `inline; filename="${fileRecord.original_name}"`);
-    res.setHeader('Content-Length', fileRecord.size);
-
-    res.sendFile(filePath);
-});
-
-// Get file metadata (without downloading)
-app.get('/api/files/:fileId/info', (req, res) => {
-    const fileId = req.params.fileId;
-
-    if (!/^[a-z0-9]+$/i.test(fileId)) {
-        return res.status(400).json({ error: 'Invalid file ID' });
-    }
-
-    const fileRecord = stmts.getFile.get(fileId);
-    if (!fileRecord) {
-        return res.status(404).json({ error: 'File not found' });
-    }
-
-    res.json({
-        id: fileRecord.id,
-        originalName: fileRecord.original_name,
-        mimeType: fileRecord.mime_type,
-        size: fileRecord.size,
-        uploadedAt: fileRecord.created_at
-    });
-});
+// NOTE: File storage removed. All file transfers use IPFS (vault.x1.xyz).
+// Files are encrypted client-side with the X25519 shared secret before upload.
+// The server never sees file contents or handles file storage.
 
 // ============================================================================
 // DEBUG

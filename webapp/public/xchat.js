@@ -1600,9 +1600,9 @@ function renderFileAttachment(fileData, direction, contactAddress) {
         `;
     }
 
-    // ── Legacy local file ────────────────────────────────────────────────────
+    // ── Legacy local file (server no longer stores files) ───────────────────
     return `
-        <a href="${fileUrl}" target="_blank" rel="noopener" class="message-file">
+        <div class="message-file" style="opacity:0.5;cursor:default;" title="This file was stored locally and is no longer available">
             <div class="message-file-icon">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/>
@@ -1611,9 +1611,9 @@ function renderFileAttachment(fileData, direction, contactAddress) {
             </div>
             <div class="message-file-info">
                 <div class="message-file-name">${escapeHtml(name)}</div>
-                <div class="message-file-size">${formatFileSize(size)}</div>
+                <div class="message-file-size">${formatFileSize(size)} · unavailable (pre-IPFS)</div>
             </div>
-        </a>
+        </div>
     `;
 }
 
