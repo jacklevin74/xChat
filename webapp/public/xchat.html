@@ -612,7 +612,7 @@
 
         /* Input area */
         .input-area {
-            padding: 12px 24px 20px;
+            padding: 10px 20px 18px;
             background: var(--bg-primary);
             display: flex;
             justify-content: center;
@@ -621,7 +621,7 @@
         .input-wrapper {
             display: flex;
             align-items: flex-end;
-            gap: 10px;
+            gap: 8px;
             max-width: 960px;
             width: 100%;
         }
@@ -660,6 +660,7 @@
             background: var(--bg-secondary);
             color: var(--text-secondary);
             cursor: pointer;
+            flex-shrink: 0;
             transition: all 0.2s;
             display: flex;
             align-items: center;
@@ -1100,44 +1101,28 @@
         /* Responsive */
         /* Large desktop */
         @media (min-width: 1600px) {
-            .sidebar {
-                width: 400px;
-                min-width: 360px;
-            }
-            .messages-container {
-                max-width: 1100px;
-                padding: 24px 40px;
-            }
-            .input-wrapper {
-                max-width: 1100px;
-            }
-            .input-area {
-                padding: 12px 40px 28px;
-            }
+            .sidebar { width: 400px; min-width: 360px; }
+            .messages-container { max-width: 1100px; padding: 24px 40px; }
+            .input-wrapper { max-width: 1100px; }
+            .input-area { padding: 10px 40px 24px; }
         }
 
         /* Desktop */
         @media (min-width: 1200px) and (max-width: 1599px) {
-            .sidebar {
-                width: 360px;
-                min-width: 320px;
-            }
-            .messages-container {
-                max-width: 960px;
-                padding: 24px 32px;
-            }
-            .input-area {
-                padding: 12px 32px 24px;
-            }
+            .sidebar { width: 360px; min-width: 320px; }
+            .messages-container { max-width: 960px; padding: 24px 32px; }
+            .input-wrapper { max-width: 960px; }
+            .input-area { padding: 10px 32px 22px; }
         }
 
-        /* Tablet: shrink sidebar but keep text */
+        /* Tablet: shrink sidebar, full-width input */
         @media (max-width: 900px) {
-            .sidebar {
-                width: 240px;
-                min-width: 200px;
-                max-width: 240px;
-            }
+            .sidebar { width: 240px; min-width: 200px; max-width: 240px; }
+            .messages-container { padding: 16px 16px; }
+            .input-wrapper { max-width: 100%; }
+            .input-area { padding: 8px 16px 16px; }
+            .attach-btn { width: 38px; height: 38px; }
+            .send-btn { width: 38px; height: 38px; }
         }
 
         /* Phone: icon-only sidebar */
@@ -1155,23 +1140,14 @@
             .wallet-badge {
                 display: none !important;
             }
-            .contact-item {
-                justify-content: center;
-                padding: 10px;
-            }
-            .new-chat-btn {
-                width: 40px;
-                height: 40px;
-                border-radius: 4px;
-                margin: 12px auto;
-                padding: 0;
-            }
-            .messages-container {
-                padding: 12px 12px;
-            }
-            .input-area {
-                padding: 8px 12px 16px;
-            }
+            .contact-item { justify-content: center; padding: 10px; }
+            .new-chat-btn { width: 40px; height: 40px; border-radius: 4px; margin: 12px auto; padding: 0; }
+            .messages-container { padding: 10px 10px; }
+            .input-wrapper { max-width: 100%; gap: 6px; }
+            .input-area { padding: 6px 10px 14px; }
+            .attach-btn { width: 36px; height: 36px; flex-shrink: 0; }
+            .send-btn { width: 36px; height: 36px; flex-shrink: 0; }
+            .input-area textarea { padding: 10px 12px; font-size: 15px; /* prevent iOS zoom */ }
             .message {
                 max-width: 85%;
             }
