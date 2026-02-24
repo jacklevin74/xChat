@@ -623,6 +623,18 @@ function connectSSE() {
                 renderMessages();
             } else if (data.type === 'ping') {
                 // Heartbeat
+            } else if (data.type === 'message_deleted') {
+                // Sender deleted a message — remove it from all chats
+                const deletedId = data.id;
+                saveDeletedId(deletedId);
+                for (const [addr, msgs] of state.messages) {
+                    const idx = msgs.findIndex(m => m.id === deletedId);
+                    if (idx !== -1) {
+                        msgs.splice(idx, 1);
+                        if (state.activeChat === addr) renderMessages();
+                        break;
+                    }
+                }
             } else if (data.type === 'typing') {
                 showTypingIndicator(data.from);
             } else if (data.type === 'read_receipt') {
@@ -1562,11 +1574,27 @@ function deleteMessage(msgId) {
     if (!state.activeChat) return;
     const msgs = state.messages.get(state.activeChat);
     if (!msgs) return;
+
+    // Find the message — only sender can delete server-side
+    const msg = msgs.find(m => m.id === msgId);
+    const isSender = msg && msg.direction === 'sent';
+
+    // Remove locally immediately for snappy UI
     const idx = msgs.findIndex(m => m.id === msgId);
     if (idx !== -1) msgs.splice(idx, 1);
-    saveDeletedId(msgId);  // Persist so it stays deleted after reconnect
+    saveDeletedId(msgId);
     renderMessages();
     showToast('Message deleted', 'success');
+
+    // If we sent it, also delete from server so the recipient can't see it
+    if (isSender && state.wallet) {
+        fetch('/api/messages/single/' + msgId, {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ senderAddress: state.wallet }),
+        }).catch(e => console.warn('[Delete] Server delete failed:', e.message));
+        // SSE will push message_deleted to recipient — no further action needed here
+    }
 }
 
 window.copyWalletAddress = function() {

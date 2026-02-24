@@ -68,9 +68,10 @@ async function ipfsUpload(ciphertextBytes, filename) {
     const form = new FormData();
     form.append('file', blob, filename + '.enc');
 
+    // No custom headers — vault.x1.xyz CORS policy only allows standard headers.
+    // The filename is embedded in the FormData part itself (second arg to append).
     const res = await fetch(`${IPFS_API}/api/v0/add`, {
         method: 'POST',
-        headers: { 'X-Filename': filename },
         body: form,
     });
 
