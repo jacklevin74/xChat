@@ -1116,9 +1116,9 @@
         }
 
         /* Tablet: shrink sidebar, full-width input */
-        @media (max-width: 900px) {
-            .sidebar { width: 240px; min-width: 200px; max-width: 240px; }
-            .messages-container { padding: 16px 16px; }
+        @media (min-width: 769px) and (max-width: 1024px) {
+            .sidebar { width: 220px !important; min-width: 220px !important; max-width: 220px !important; }
+            .messages-container { padding: 16px; }
             .input-wrapper { max-width: 100%; }
             .input-area { padding: 8px 16px 16px; }
             .attach-btn { width: 38px; height: 38px; }
@@ -1126,28 +1126,34 @@
         }
 
         /* Phone: icon-only sidebar */
-        @media (max-width: 560px) {
+        @media (max-width: 768px) {
             .sidebar {
-                width: 64px;
-                min-width: 64px;
-                max-width: 64px;
+                width: 56px !important;
+                min-width: 56px !important;
+                max-width: 56px !important;
+                flex-shrink: 0;
             }
             .sidebar-header h1 span,
             .search-box,
             .contact-info,
             .contact-meta,
             .new-chat-btn span,
-            .wallet-badge {
+            .wallet-badge,
+            .status span:last-child {
                 display: none !important;
             }
-            .contact-item { justify-content: center; padding: 10px; }
-            .new-chat-btn { width: 40px; height: 40px; border-radius: 4px; margin: 12px auto; padding: 0; }
-            .messages-container { padding: 10px 10px; }
+            .sidebar-header { padding: 8px; }
+            .sidebar-header-top { justify-content: center; }
+            .status { justify-content: center; }
+            .contact-item { justify-content: center; padding: 10px 0; }
+            .new-chat-btn { width: 38px; height: 38px; border-radius: 8px; margin: 8px auto; padding: 0; }
+            .messages-container { padding: 10px; }
             .input-wrapper { max-width: 100%; gap: 6px; }
             .input-area { padding: 6px 10px 14px; }
-            .attach-btn { width: 36px; height: 36px; flex-shrink: 0; }
-            .send-btn { width: 36px; height: 36px; flex-shrink: 0; }
-            .input-area textarea { padding: 10px 12px; font-size: 15px; /* prevent iOS zoom */ }
+            .attach-btn { width: 36px; height: 36px; }
+            .send-btn { width: 36px; height: 36px; }
+            .input-area textarea { padding: 10px 12px; font-size: 16px; /* prevent iOS zoom */ }
+            .message { max-width: 85%; }
             .message {
                 max-width: 85%;
             }
