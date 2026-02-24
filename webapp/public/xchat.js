@@ -1517,31 +1517,52 @@ function updateWalletDisplay() {
 }
 
 window.deleteConversation = async function() {
-    if (!state.activeChat || !state.walletProvider) return;
+    if (!state.wallet) { showToast('Not connected', 'error'); return; }
+    if (!state.walletProvider) { showToast('Wallet provider missing', 'error'); return; }
+
+    if (!confirm('Delete all messages in this conversation? This cannot be undone.')) return;
 
     try {
         const messageText = `X1 Messaging: Delete my message history`;
         const messageBytes = new TextEncoder().encode(messageText);
-        showToast('Sign to delete...', 'info');
-        const { signature } = await state.walletProvider.signMessage(messageBytes, 'utf8');
+        showToast('Sign to confirm deletion...', 'info');
+
+        let signatureBytes;
+        try {
+            const result = await state.walletProvider.signMessage(messageBytes, 'utf8');
+            // Different wallets return signature differently
+            signatureBytes = result.signature || result;
+            if (!(signatureBytes instanceof Uint8Array)) {
+                signatureBytes = new Uint8Array(Object.values(signatureBytes));
+            }
+        } catch (e) {
+            if (e.message?.includes('User rejected') || e.code === 4001) return;
+            throw e;
+        }
 
         const res = await fetch(`${API_BASE}/api/messages/${encodeURIComponent(state.wallet)}`, {
             method: 'DELETE',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ signature: base58Encode(signature) })
+            body: JSON.stringify({ signature: base58Encode(signatureBytes) })
         });
 
+        const data = await res.json().catch(() => ({}));
+
         if (res.ok) {
-            state.messages.clear();
+            // Clear local state
+            state.messages.delete(state.activeChat);
             state.contacts.forEach(c => { c.lastMessage = null; c.unread = 0; });
+            state.activeChat = null;
             updateContactsList();
             renderMessages();
-            showToast('Messages deleted', 'success');
+            showToast(`Deleted ${data.deleted || 0} messages`, 'success');
+        } else {
+            console.error('[Delete] Server error:', data);
+            showToast(`Delete failed: ${data.error || res.status}`, 'error');
         }
     } catch (e) {
-        if (!e.message?.includes('User rejected')) {
-            showToast('Delete failed', 'error');
-        }
+        console.error('[Delete] Error:', e);
+        showToast(`Delete failed: ${e.message}`, 'error');
     }
 };
 
