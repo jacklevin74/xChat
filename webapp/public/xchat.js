@@ -388,9 +388,13 @@ function updateMessageReadStatus(messageId, readAt) {
 // ============================================================================
 
 async function getOrCreateContact(address) {
-    // Return existing contact
+    // Return existing contact — but recompute sessionKey if it was stripped on save
     if (state.contacts.has(address)) {
-        return state.contacts.get(address);
+        const c = state.contacts.get(address);
+        if (!c.sessionKey && c.publicKey && state.privateKey) {
+            c.sessionKey = computeSharedSecret(state.privateKey, c.publicKey);
+        }
+        return c;
     }
 
     // Check if we're already fetching this contact (prevent race condition)
@@ -732,8 +736,13 @@ function disconnectSSE() {
 // Snapshot the current chat context for a specific wallet address.
 function saveWalletState(address) {
     if (!address) return;
+    // Strip sessionKey before saving — it's derived from privateKey which may change.
+    // It gets recomputed lazily in getOrCreateContact().
+    const contactsClean = new Map(
+        [...state.contacts].map(([k, v]) => [k, { publicKey: v.publicKey, sessionKey: null, lastMessage: v.lastMessage, unread: v.unread }])
+    );
     walletStates.set(address, {
-        contacts: new Map(state.contacts),
+        contacts: contactsClean,
         messages: new Map([...state.messages].map(([k, v]) => [k, [...v]])),
         activeChat: state.activeChat,
         seenMessageIds: new Set(state.seenMessageIds),
