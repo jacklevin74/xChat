@@ -17,7 +17,7 @@ const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvw
 const DEMO_ADDRESS = 'DEMO';
 const DEMO_DELAY_BASE = 2400; // base ms between messages (3x slower)
 const DEMO_DELAY_RANDOM = () => 1000 + Math.random() * 4000; // 1-5 seconds random delay
-const STREAM_CHUNK_SIZE = 120; // bytes
+const STREAM_CHUNK_SIZE = 4096; // bytes — raised from 120 to avoid chunking normal messages
 const STREAM_TTL_MS = 2 * 60 * 1000; // 2 minutes
 
 // Demo conversation messages - educational walkthrough
@@ -71,6 +71,10 @@ const state = {
     readMessageIds: new Set(), // Track which messages have been read (persisted to localStorage)
     incomingStreams: new Map(), // stream_id -> { from, to, contactAddress, chunkTotal, receivedChunks, createdAt }
 };
+
+// Per-wallet context cache — keyed by wallet address so switching wallets
+// preserves each user's own conversation history within the same page session.
+const walletStates = new Map();
 
 // ============================================================================
 // READ MESSAGE TRACKING (localStorage persistence)
@@ -722,6 +726,49 @@ function disconnectSSE() {
         state.sseConnection = null;
     }
     state.historyLoaded = false;
+}
+
+// Snapshot the current chat context for a specific wallet address.
+function saveWalletState(address) {
+    if (!address) return;
+    walletStates.set(address, {
+        contacts: new Map(state.contacts),
+        messages: new Map([...state.messages].map(([k, v]) => [k, [...v]])),
+        activeChat: state.activeChat,
+        seenMessageIds: new Set(state.seenMessageIds),
+        historyLoaded: state.historyLoaded,
+        lastSyncTimestamp: state.lastSyncTimestamp,
+        readMessageIds: new Set(state.readMessageIds),
+        // pendingContacts and incomingStreams are transient — don't restore them
+    });
+}
+
+// Restore a previously saved wallet context, or initialise a clean slate.
+function loadWalletState(address) {
+    const saved = walletStates.get(address);
+    if (saved) {
+        state.contacts       = saved.contacts;
+        state.messages       = saved.messages;
+        state.activeChat     = saved.activeChat;
+        state.seenMessageIds = saved.seenMessageIds;
+        state.historyLoaded  = saved.historyLoaded;
+        state.lastSyncTimestamp = saved.lastSyncTimestamp;
+        state.readMessageIds = saved.readMessageIds;
+        state.pendingContacts = new Map();
+        state.incomingStreams  = new Map();
+        return true; // restored
+    }
+    // First time for this wallet — start fresh
+    state.contacts        = new Map();
+    state.messages        = new Map();
+    state.activeChat      = null;
+    state.seenMessageIds  = new Set();
+    state.historyLoaded   = false;
+    state.lastSyncTimestamp = 0;
+    state.readMessageIds  = new Set();
+    state.pendingContacts = new Map();
+    state.incomingStreams  = new Map();
+    return false;
 }
 
 function updateConnectionStatus(online) {
@@ -1427,54 +1474,51 @@ window.clearFileSelection = function() {
     document.getElementById('filePreviewBar').classList.remove('visible');
 };
 
+// ── IPFS Encrypted Uploader (vault.x1.xyz) ───────────────────────────────────
+import { XChatIPFSUploader } from './ipfs-upload.js';
+
+let _ipfsUploader = null;
+function getIPFSUploader() {
+    if (!_ipfsUploader) {
+        _ipfsUploader = new XChatIPFSUploader({
+            walletProvider: state.walletProvider,
+            walletAddress: state.wallet,
+            onProgress({ pct, msg }) {
+                const progressBar = document.getElementById('uploadProgress');
+                const progressFill = document.getElementById('uploadProgressFill');
+                const progressText = document.getElementById('uploadProgressText');
+                progressBar.classList.add('visible');
+                progressFill.style.width = pct + '%';
+                progressText.textContent = msg;
+            },
+            onComplete() {},
+            onError(err) { showToast('Upload failed: ' + err.message, 'error'); },
+        });
+    }
+    return _ipfsUploader;
+}
+
 async function uploadFile(file) {
     const progressBar = document.getElementById('uploadProgress');
-    const progressFill = document.getElementById('uploadProgressFill');
-    const progressText = document.getElementById('uploadProgressText');
-
     fileState.uploading = true;
     progressBar.classList.add('visible');
-    progressFill.style.width = '0%';
-    progressText.textContent = 'Uploading...';
 
     try {
-        const formData = new FormData();
-        formData.append('file', file);
-        formData.append('uploader', state.wallet);
+        const uploader = getIPFSUploader();
+        const result = await uploader.upload(file);
+        fileState.uploading = false;
+        progressBar.classList.remove('visible');
 
-        // Use XMLHttpRequest for progress tracking
-        return new Promise((resolve, reject) => {
-            const xhr = new XMLHttpRequest();
-
-            xhr.upload.onprogress = (e) => {
-                if (e.lengthComputable) {
-                    const percent = Math.round((e.loaded / e.total) * 100);
-                    progressFill.style.width = percent + '%';
-                    progressText.textContent = `Uploading... ${percent}%`;
-                }
-            };
-
-            xhr.onload = () => {
-                fileState.uploading = false;
-                progressBar.classList.remove('visible');
-
-                if (xhr.status === 200) {
-                    const response = JSON.parse(xhr.responseText);
-                    resolve(response);
-                } else {
-                    reject(new Error('Upload failed'));
-                }
-            };
-
-            xhr.onerror = () => {
-                fileState.uploading = false;
-                progressBar.classList.remove('visible');
-                reject(new Error('Upload failed'));
-            };
-
-            xhr.open('POST', `${API_BASE}/api/files`);
-            xhr.send(formData);
-        });
+        // Return in the shape sendMessage() expects
+        return {
+            fileId: result.cid,
+            originalName: result.filename,
+            mimeType: file.type || 'application/octet-stream',
+            size: result.size,
+            cid: result.cid,
+            vaultUrl: result.vaultUrl,
+            ipfs: true,
+        };
     } catch (e) {
         fileState.uploading = false;
         progressBar.classList.remove('visible');
@@ -1487,8 +1531,11 @@ function isImageMimeType(mimeType) {
 }
 
 function renderFileAttachment(fileData, direction) {
-    const { fileId, originalName, mimeType, size } = fileData;
-    const fileUrl = `${API_BASE}/api/files/${fileId}`;
+    const { fileId, originalName, mimeType, size, cid, vaultUrl, ipfs } = fileData;
+    // IPFS-encrypted files link to vault.x1.xyz for decryption
+    const fileUrl = ipfs
+        ? (vaultUrl || `https://vault.x1.xyz/ipfs/crypto.html#${cid}`)
+        : `${API_BASE}/api/files/${fileId}`;
 
     if (isImageMimeType(mimeType)) {
         return `
@@ -1523,7 +1570,7 @@ function renderFileAttachment(fileData, direction) {
             </div>
             <div class="message-file-info">
                 <div class="message-file-name">${escapeHtml(originalName)}</div>
-                <div class="message-file-size">${formatFileSize(size)}</div>
+                <div class="message-file-size">${formatFileSize(size)}${ipfs ? ' · 🔐 IPFS encrypted' : ''}</div>
             </div>
         </a>
     `;
@@ -1747,9 +1794,19 @@ window.connectWallet = async function() {
         console.log('[Connect] Requesting wallet connection...');
         const resp = await provider.connect();
         const walletAddress = resp.publicKey.toString();
+
+        // If a different wallet was already active, save its context before switching
+        if (state.wallet && state.wallet !== walletAddress) {
+            saveWalletState(state.wallet);
+            disconnectSSE();
+        }
+
         state.wallet = walletAddress;
         state.walletProvider = provider;
         localStorage.setItem('x1msg-wallet', walletAddress);
+
+        // Restore this wallet's context (or initialise a clean slate)
+        loadWalletState(walletAddress);
         loadReadMessages();
 
         // Check for cached signature
@@ -1821,10 +1878,15 @@ window.connectWallet = async function() {
 };
 
 window.disconnectWallet = function() {
+    // Save current wallet's context before tearing down
+    if (state.wallet) {
+        saveWalletState(state.wallet);
+    }
+
     // Disconnect SSE
     disconnectSSE();
 
-    // Clear state
+    // Clear active session state (context is preserved in walletStates)
     state.wallet = null;
     state.walletProvider = null;
     state.privateKey = null;
@@ -1835,7 +1897,9 @@ window.disconnectWallet = function() {
     state.seenMessageIds.clear();
     state.historyLoaded = false;
     state.pendingContacts.clear();
+    state.lastSyncTimestamp = 0;
     state.readMessageIds.clear();
+    state.incomingStreams.clear();
 
     // Clear localStorage
     const cachedWallet = localStorage.getItem('x1msg-wallet');
@@ -1890,6 +1954,9 @@ async function tryAutoReconnect() {
         state.publicKey = keyPair.publicKey;
         state.walletProvider = window.x1Wallet || window.x1 || window.x1_wallet || window.backpack ||
                                window.phantom?.solana || window.solana;
+
+        // Restore any previously saved context for this wallet
+        loadWalletState(cachedWallet);
         loadReadMessages();
 
         document.getElementById('connectOverlay').classList.add('hidden');
