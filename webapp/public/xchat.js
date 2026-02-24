@@ -6,6 +6,7 @@ import { hkdf } from '@noble/hashes/hkdf';
 import { sha256 } from '@noble/hashes/sha256';
 import { gcm } from '@noble/ciphers/aes';
 import { randomBytes } from '@noble/ciphers/webcrypto';
+import { encryptAndUpload, fetchAndDecrypt, downloadFile, isFileAttachment } from './ipfs-upload.js';
 
 // ============================================================================
 // CONSTANTS
@@ -1123,8 +1124,8 @@ function renderMessages() {
 
             // Build file attachment HTML if present
             let fileHtml = '';
-            if (fileData && fileData.fileId) {
-                fileHtml = renderFileAttachment(fileData, direction);
+            if (fileData && (fileData.fileId || isFileAttachment(fileData))) {
+                fileHtml = renderFileAttachment(fileData, direction, msg.from !== state.wallet ? msg.from : state.activeChat);
             }
 
             // Build text content HTML
@@ -1474,51 +1475,38 @@ window.clearFileSelection = function() {
     document.getElementById('filePreviewBar').classList.remove('visible');
 };
 
-// ── IPFS Encrypted Uploader (vault.x1.xyz) ───────────────────────────────────
-import { XChatIPFSUploader } from './ipfs-upload.js';
-
-let _ipfsUploader = null;
-function getIPFSUploader() {
-    if (!_ipfsUploader) {
-        _ipfsUploader = new XChatIPFSUploader({
-            walletProvider: state.walletProvider,
-            walletAddress: state.wallet,
-            onProgress({ pct, msg }) {
-                const progressBar = document.getElementById('uploadProgress');
-                const progressFill = document.getElementById('uploadProgressFill');
-                const progressText = document.getElementById('uploadProgressText');
-                progressBar.classList.add('visible');
-                progressFill.style.width = pct + '%';
-                progressText.textContent = msg;
-            },
-            onComplete() {},
-            onError(err) { showToast('Upload failed: ' + err.message, 'error'); },
-        });
-    }
-    return _ipfsUploader;
-}
+// ── IPFS E2E File Upload ──────────────────────────────────────────────────────
+// Encrypts with the X25519 shared secret (same key as messages).
+// Recipient decrypts locally — IPFS sees only ciphertext.
 
 async function uploadFile(file) {
-    const progressBar = document.getElementById('uploadProgress');
+    const progressBar  = document.getElementById('uploadProgress');
+    const progressFill = document.getElementById('uploadProgressFill');
+    const progressText = document.getElementById('uploadProgressText');
+
+    // Need an active chat to know who the recipient is
+    if (!state.activeChat) throw new Error('No active chat');
+    const contact = state.contacts.get(state.activeChat);
+    if (!contact?.publicKey) throw new Error('Recipient public key not found');
+
     fileState.uploading = true;
     progressBar.classList.add('visible');
 
     try {
-        const uploader = getIPFSUploader();
-        const result = await uploader.upload(file);
+        const attachment = await encryptAndUpload(
+            file,
+            state.privateKey,
+            contact.publicKey,
+            ({ pct, msg }) => {
+                progressFill.style.width = pct + '%';
+                progressText.textContent = msg;
+            }
+        );
+
         fileState.uploading = false;
         progressBar.classList.remove('visible');
+        return attachment;   // xchat-file-v1 payload — goes into message JSON
 
-        // Return in the shape sendMessage() expects
-        return {
-            fileId: result.cid,
-            originalName: result.filename,
-            mimeType: file.type || 'application/octet-stream',
-            size: result.size,
-            cid: result.cid,
-            vaultUrl: result.vaultUrl,
-            ipfs: true,
-        };
     } catch (e) {
         fileState.uploading = false;
         progressBar.classList.remove('visible');
@@ -1530,12 +1518,16 @@ function isImageMimeType(mimeType) {
     return mimeType && mimeType.startsWith('image/');
 }
 
-function renderFileAttachment(fileData, direction) {
-    const { fileId, originalName, mimeType, size, cid, vaultUrl, ipfs } = fileData;
-    // IPFS-encrypted files link to vault.x1.xyz for decryption
-    const fileUrl = ipfs
-        ? (vaultUrl || `https://vault.x1.xyz/ipfs/crypto.html#${cid}`)
-        : `${API_BASE}/api/files/${fileId}`;
+function renderFileAttachment(fileData, direction, contactAddress) {
+    // Handle both old local-file shape and new xchat-file-v1 IPFS shape
+    const isIPFS = isFileAttachment(fileData);
+    const name   = isIPFS ? fileData.name : (fileData.originalName || 'file');
+    const mime   = isIPFS ? fileData.mime : (fileData.mimeType || '');
+    const size   = isIPFS ? fileData.size : (fileData.size || 0);
+    const cid    = isIPFS ? fileData.cid  : null;
+
+    // Legacy local files still use the old URL
+    const fileUrl = isIPFS ? null : `${API_BASE}/api/files/${fileData.fileId}`;
 
     if (isImageMimeType(mimeType)) {
         return `
@@ -1559,7 +1551,56 @@ function renderFileAttachment(fileData, direction) {
         `;
     }
 
-    // Generic file attachment
+    // ── IPFS E2E encrypted file ──────────────────────────────────────────────
+    if (isIPFS) {
+        const attachId = 'ipfs-' + cid.slice(0, 8);
+        // Register a one-time click handler for decrypt+download
+        setTimeout(() => {
+            const el = document.getElementById(attachId);
+            if (!el) return;
+            el.addEventListener('click', async () => {
+                const contact = state.contacts.get(contactAddress || state.activeChat);
+                if (!contact?.publicKey) {
+                    showToast('Cannot decrypt: recipient public key missing', 'error');
+                    return;
+                }
+                el.style.opacity = '0.6';
+                el.title = 'Decrypting…';
+                try {
+                    const { bytes, name: n, mime: m } = await fetchAndDecrypt(
+                        fileData,
+                        state.privateKey,
+                        contact.publicKey,
+                        ({ msg }) => { el.title = msg; }
+                    );
+                    downloadFile(bytes, n, m);
+                    el.style.opacity = '1';
+                    el.title = 'Downloaded!';
+                } catch (e) {
+                    showToast('Decrypt failed: ' + e.message, 'error');
+                    el.style.opacity = '1';
+                    el.title = 'Decrypt failed';
+                }
+            });
+        }, 0);
+
+        return `
+            <div id="${attachId}" class="message-file" style="cursor:pointer;" title="Click to decrypt & download">
+                <div class="message-file-icon">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+                        <path d="M7 11V7a5 5 0 0110 0v4"/>
+                    </svg>
+                </div>
+                <div class="message-file-info">
+                    <div class="message-file-name">${escapeHtml(name)}</div>
+                    <div class="message-file-size">${formatFileSize(size)} · 🔐 E2E encrypted · IPFS</div>
+                </div>
+            </div>
+        `;
+    }
+
+    // ── Legacy local file ────────────────────────────────────────────────────
     return `
         <a href="${fileUrl}" target="_blank" rel="noopener" class="message-file">
             <div class="message-file-icon">
@@ -1569,8 +1610,8 @@ function renderFileAttachment(fileData, direction) {
                 </svg>
             </div>
             <div class="message-file-info">
-                <div class="message-file-name">${escapeHtml(originalName)}</div>
-                <div class="message-file-size">${formatFileSize(size)}${ipfs ? ' · 🔐 IPFS encrypted' : ''}</div>
+                <div class="message-file-name">${escapeHtml(name)}</div>
+                <div class="message-file-size">${formatFileSize(size)}</div>
             </div>
         </a>
     `;
@@ -1599,13 +1640,8 @@ window.sendMessage = async function() {
         let fileData = null;
         if (hasFile) {
             try {
-                const uploadResult = await uploadFile(fileState.selectedFile);
-                fileData = {
-                    fileId: uploadResult.fileId,
-                    originalName: uploadResult.originalName,
-                    mimeType: uploadResult.mimeType,
-                    size: uploadResult.size
-                };
+                // uploadFile returns a xchat-file-v1 IPFS attachment payload
+                fileData = await uploadFile(fileState.selectedFile);
                 clearFileSelection();
             } catch (e) {
                 showToast('File upload failed', 'error');
@@ -1613,16 +1649,17 @@ window.sendMessage = async function() {
             }
         }
 
-        // Build message content - include file metadata if present
+        // Build message content
+        // xchat-file-v1 payloads are self-describing; text is plain string for BC
         let messagePayload = {};
         if (fileData) {
-            messagePayload.file = fileData;
+            messagePayload.file = fileData;   // { type:'xchat-file-v1', cid, name, mime, size, iv }
         }
         if (content) {
             messagePayload.text = content;
         }
 
-        // If only text (no file), use simple string format for backward compatibility
+        // Backward-compat: pure text stays as plain string, not JSON
         const finalContent = fileData ? JSON.stringify(messagePayload) : content;
         const plaintext = new TextEncoder().encode(finalContent);
 

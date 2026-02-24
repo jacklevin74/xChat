@@ -1,460 +1,188 @@
-// xChat IPFS Uploader
-// Encrypt & pin files to vault.x1.xyz — wallet-gated, same key derivation as xChat
-// Built: 2026-02-25 | Theo (@xxen_bot) for Jack Levin
+// xChat IPFS File Transfer — True E2E Encryption
+//
+// Encryption model:
+//   File is encrypted with the X25519 ECDH shared secret between sender and
+//   recipient — the same key that encrypts xChat messages. The recipient can
+//   decrypt without a wallet signature or vault login. IPFS is just storage.
+//
+// Flow (send):
+//   1. Derive shared secret:  ECDH(senderPrivKey, recipientPubKey) → HKDF
+//   2. Encrypt file:          AES-256-GCM(sharedSecret, randomIV, fileBytes)
+//   3. Upload ciphertext:     POST to vault.x1.xyz/ipfs
+//   4. Send CID in message:   { type:'file', cid, name, size, iv, tag }
+//
+// Flow (receive):
+//   1. Derive shared secret:  ECDH(recipientPrivKey, senderPubKey) → HKDF
+//   2. Fetch ciphertext:      GET vault.x1.xyz/ipfs/files/<cid>
+//   3. Decrypt:               AES-256-GCM(sharedSecret, iv, ciphertext)
+//   4. Offer download:        createObjectURL(decryptedBytes)
+//
+// The server (IPFS) sees only random-looking ciphertext. No key ever touches
+// the server. Two people who share a conversation can decrypt; nobody else can.
+//
+// Built: 2026-02-25 | Theo (@xxen_bot)
+
+import { x25519 } from '@noble/curves/ed25519';
+import { hkdf } from '@noble/hashes/hkdf';
+import { sha256 } from '@noble/hashes/sha256';
 
 // ── Constants ────────────────────────────────────────────────────────────────
+
 const IPFS_API       = 'https://vault.x1.xyz/ipfs';
-const DERIVATION_MSG = 'IPFS_ENCRYPTION_KEY_V1';  // matches skills/ipfs-encrypted-storage
-const MAX_FILE_SIZE  = 50 * 1024 * 1024;           // 50MB cap
-const XCHAT_API_BASE = (() => {
-  const m = window.location.pathname.match(/^\/([^/]+)/);
-  return m ? `/${m[1]}` : '';
-})();
+const DOMAIN_SEP     = 'x1-msg-v1';              // same as xchat.js
+const FILE_LABEL     = 'x1-file-v1';             // sub-label for file encryption
+const MAX_FILE_BYTES = 50 * 1024 * 1024;         // 50 MB
 
-// ── Key derivation (wallet-signature → AES-256-GCM key) ─────────────────────
-// Mirrors the Python upload.py logic so files are cross-compatible
+// ── Shared-secret derivation (mirrors xchat.js computeSharedSecret) ──────────
 
-async function deriveEncryptionKey(walletProvider, walletAddress) {
-  // Ask wallet to sign the derivation message (same as vault.x1.xyz/ipfs/crypto.html)
-  let sig;
-  try {
-    const encodedMsg = new TextEncoder().encode(DERIVATION_MSG);
-    sig = await walletProvider.signMessage(encodedMsg, 'utf8');
-  } catch (e) {
-    throw new Error('Wallet signature rejected — cannot derive encryption key');
-  }
-
-  // SHA-256(signature bytes) → 256-bit AES key
-  const sigBytes = sig instanceof Uint8Array ? sig : new Uint8Array(sig);
-  const keyBytes = await crypto.subtle.digest('SHA-256', sigBytes);
-  return await crypto.subtle.importKey(
-    'raw', keyBytes,
-    { name: 'AES-GCM' },
-    false,
-    ['encrypt', 'decrypt']
-  );
+function computeSharedSecret(ourPrivateKey, theirPublicKey) {
+    const shared = x25519.getSharedSecret(ourPrivateKey, theirPublicKey);
+    // Use a different label than messages so file keys are domain-separated
+    return hkdf(sha256, shared, new Uint8Array(0),
+        new TextEncoder().encode(DOMAIN_SEP + '-' + FILE_LABEL), 32);
 }
 
-// ── Encrypt file ─────────────────────────────────────────────────────────────
+// ── AES-256-GCM via WebCrypto (browser native — no extra deps) ───────────────
 
-async function encryptFile(aesKey, fileBytes, filename) {
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ciphertext = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
-    aesKey,
-    fileBytes
-  );
-
-  // Pack: IV (12) || ciphertext+tag
-  const packed = new Uint8Array(12 + ciphertext.byteLength);
-  packed.set(iv, 0);
-  packed.set(new Uint8Array(ciphertext), 12);
-
-  // Wrap in JSON envelope (matches vault.x1.xyz format)
-  const envelope = {
-    version: 1,
-    algorithm: 'AES-256-GCM',
-    filename,
-    data: btoa(String.fromCharCode(...packed)),
-  };
-
-  return new TextEncoder().encode(JSON.stringify(envelope));
+async function importAESKey(keyBytes) {
+    return crypto.subtle.importKey('raw', keyBytes, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
 }
 
-// ── Upload to IPFS ───────────────────────────────────────────────────────────
-
-async function uploadToIPFS(encryptedBytes, filename, walletAddress) {
-  const blob = new Blob([encryptedBytes], { type: 'application/octet-stream' });
-  const form = new FormData();
-  form.append('file', blob, filename + '.enc');
-
-  const res = await fetch(`${IPFS_API}/api/v0/add`, {
-    method: 'POST',
-    headers: {
-      'X-Pubkey': walletAddress,
-      'X-Filename': filename,
-    },
-    body: form,
-  });
-
-  if (!res.ok) {
-    const err = await res.text().catch(() => res.statusText);
-    throw new Error(`IPFS upload failed: ${err}`);
-  }
-
-  const data = await res.json();
-  return data.Hash || data.cid || data.CID;
+async function aesEncrypt(keyBytes, plaintext) {
+    const key = await importAESKey(keyBytes);
+    const iv  = crypto.getRandomValues(new Uint8Array(12));
+    const ct  = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plaintext);
+    return { iv, ciphertext: new Uint8Array(ct) };
 }
 
-// ── Build xChat share message ────────────────────────────────────────────────
-
-function buildShareMessage(filename, cid, sizeBytes) {
-  const sizeFmt = sizeBytes > 1024 * 1024
-    ? (sizeBytes / 1024 / 1024).toFixed(1) + ' MB'
-    : (sizeBytes / 1024).toFixed(1) + ' KB';
-
-  return `📎 *${filename}* (${sizeFmt})\n` +
-    `🔐 Encrypted · Wallet-gated\n` +
-    `📦 IPFS: \`${cid}\`\n` +
-    `🔗 ${IPFS_API}/files/${cid}\n` +
-    `_Decrypt at vault.x1.xyz/ipfs/crypto.html_`;
+async function aesDecrypt(keyBytes, iv, ciphertext) {
+    const key = await importAESKey(keyBytes);
+    const pt  = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
+    return new Uint8Array(pt);
 }
 
-// ── Main uploader class ──────────────────────────────────────────────────────
+// ── IPFS upload/download ──────────────────────────────────────────────────────
 
-class XChatIPFSUploader {
-  constructor({ walletProvider, walletAddress, onProgress, onComplete, onError }) {
-    this.walletProvider  = walletProvider;
-    this.walletAddress   = walletAddress;
-    this.onProgress      = onProgress  || (() => {});
-    this.onComplete      = onComplete  || (() => {});
-    this.onError         = onError     || console.error;
-    this._aesKey         = null;
-  }
+async function ipfsUpload(ciphertextBytes, filename) {
+    const blob = new Blob([ciphertextBytes], { type: 'application/octet-stream' });
+    const form = new FormData();
+    form.append('file', blob, filename + '.enc');
 
-  // Derive key once per session
-  async init() {
-    if (this._aesKey) return;
-    this.onProgress({ stage: 'signing', pct: 0, msg: 'Sign to unlock file encryption...' });
-    this._aesKey = await deriveEncryptionKey(this.walletProvider, this.walletAddress);
-    this.onProgress({ stage: 'ready', pct: 0, msg: 'Ready to upload' });
-  }
+    const res = await fetch(`${IPFS_API}/api/v0/add`, {
+        method: 'POST',
+        headers: { 'X-Filename': filename },
+        body: form,
+    });
 
-  async upload(file) {
-    try {
-      // Validate
-      if (file.size > MAX_FILE_SIZE) {
+    if (!res.ok) {
+        const msg = await res.text().catch(() => res.statusText);
+        throw new Error(`IPFS upload failed (${res.status}): ${msg}`);
+    }
+
+    const data = await res.json();
+    const cid  = data.Hash || data.cid || data.CID;
+    if (!cid) throw new Error('IPFS returned no CID');
+    return cid;
+}
+
+async function ipfsFetch(cid) {
+    const res = await fetch(`${IPFS_API}/files/${cid}`);
+    if (!res.ok) throw new Error(`IPFS fetch failed (${res.status})`);
+    return new Uint8Array(await res.arrayBuffer());
+}
+
+// ── Base64 helpers (for embedding iv in message JSON) ────────────────────────
+
+function toB64(bytes) {
+    return btoa(String.fromCharCode(...bytes));
+}
+
+function fromB64(str) {
+    return new Uint8Array(atob(str).split('').map(c => c.charCodeAt(0)));
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+/**
+ * Encrypt a File and upload it to IPFS.
+ *
+ * @param {File}       file            - Browser File object
+ * @param {Uint8Array} ourPrivateKey   - Sender's X25519 private key (from state.privateKey)
+ * @param {Uint8Array} theirPublicKey  - Recipient's X25519 public key (from contact.publicKey)
+ * @param {Function}   onProgress      - ({ pct, msg }) callback
+ * @returns {Object} message attachment payload — embed this in the xChat message
+ */
+export async function encryptAndUpload(file, ourPrivateKey, theirPublicKey, onProgress = () => {}) {
+    if (file.size > MAX_FILE_BYTES) {
         throw new Error(`File too large (${(file.size / 1024 / 1024).toFixed(1)} MB). Max 50 MB.`);
-      }
+    }
 
-      await this.init();
+    onProgress({ pct: 5, msg: `Reading ${file.name}…` });
+    const fileBytes = new Uint8Array(await file.arrayBuffer());
 
-      // Read
-      this.onProgress({ stage: 'reading', pct: 10, msg: `Reading ${file.name}...` });
-      const fileBytes = new Uint8Array(await file.arrayBuffer());
+    onProgress({ pct: 20, msg: 'Deriving shared key…' });
+    const sharedSecret = computeSharedSecret(ourPrivateKey, theirPublicKey);
 
-      // Encrypt
-      this.onProgress({ stage: 'encrypting', pct: 30, msg: 'Encrypting...' });
-      const encrypted = await encryptFile(this._aesKey, fileBytes, file.name);
+    onProgress({ pct: 35, msg: 'Encrypting…' });
+    const { iv, ciphertext } = await aesEncrypt(sharedSecret, fileBytes);
 
-      // Upload
-      this.onProgress({ stage: 'uploading', pct: 60, msg: 'Uploading to IPFS...' });
-      const cid = await uploadToIPFS(encrypted, file.name, this.walletAddress);
+    onProgress({ pct: 55, msg: 'Uploading to IPFS…' });
+    const cid = await ipfsUpload(ciphertext, file.name);
 
-      this.onProgress({ stage: 'done', pct: 100, msg: 'Upload complete!' });
+    onProgress({ pct: 100, msg: 'Done!' });
 
-      const result = {
-        filename: file.name,
+    // Payload embedded in the xChat message body as JSON
+    return {
+        type:    'xchat-file-v1',
         cid,
-        size: file.size,
-        shareMessage: buildShareMessage(file.name, cid, file.size),
-        decryptUrl: `${IPFS_API}/files/${cid}`,
-        vaultUrl: `https://vault.x1.xyz/ipfs/crypto.html#${cid}`,
-      };
-
-      this.onComplete(result);
-      return result;
-
-    } catch (err) {
-      this.onError(err);
-      throw err;
-    }
-  }
+        name:    file.name,
+        mime:    file.type || 'application/octet-stream',
+        size:    file.size,
+        iv:      toB64(iv),          // 12 bytes — safe to send openly
+    };
 }
 
-// ── UI Widget ────────────────────────────────────────────────────────────────
-// Drop-in button + modal for xchat.html
+/**
+ * Fetch and decrypt a file attachment received in an xChat message.
+ *
+ * @param {Object}     attachment     - The xchat-file-v1 payload from the message
+ * @param {Uint8Array} ourPrivateKey  - Recipient's X25519 private key
+ * @param {Uint8Array} theirPublicKey - Sender's X25519 public key
+ * @param {Function}   onProgress     - ({ pct, msg }) callback
+ * @returns {Object} { bytes: Uint8Array, name: string, mime: string }
+ */
+export async function fetchAndDecrypt(attachment, ourPrivateKey, theirPublicKey, onProgress = () => {}) {
+    const { cid, name, mime, iv: ivB64 } = attachment;
 
-function createUploaderUI({ walletProvider, walletAddress, onShareMessage }) {
+    onProgress({ pct: 10, msg: 'Fetching from IPFS…' });
+    const ciphertext = await ipfsFetch(cid);
 
-  // ── Styles ──
-  const style = document.createElement('style');
-  style.textContent = `
-    .ipfs-btn {
-      background: none;
-      border: none;
-      cursor: pointer;
-      padding: 6px 8px;
-      border-radius: 6px;
-      color: #9ca3af;
-      font-size: 18px;
-      transition: color 0.2s, background 0.2s;
-      display: flex;
-      align-items: center;
-    }
-    .ipfs-btn:hover { color: #fff; background: #1e293b; }
+    onProgress({ pct: 60, msg: 'Decrypting…' });
+    const sharedSecret = computeSharedSecret(ourPrivateKey, theirPublicKey);
+    const iv           = fromB64(ivB64);
+    const plaintext    = await aesDecrypt(sharedSecret, iv, ciphertext);
 
-    .ipfs-modal-overlay {
-      display: none;
-      position: fixed;
-      inset: 0;
-      background: rgba(0,0,0,0.7);
-      z-index: 9999;
-      align-items: center;
-      justify-content: center;
-    }
-    .ipfs-modal-overlay.open { display: flex; }
+    onProgress({ pct: 100, msg: 'Done!' });
 
-    .ipfs-modal {
-      background: #0f172a;
-      border: 1px solid #1e293b;
-      border-radius: 12px;
-      padding: 24px;
-      width: 380px;
-      max-width: 95vw;
-      color: #fff;
-      font-family: inherit;
-    }
-    .ipfs-modal h3 {
-      margin: 0 0 4px;
-      font-size: 16px;
-      font-weight: 600;
-    }
-    .ipfs-modal p.sub {
-      margin: 0 0 20px;
-      font-size: 12px;
-      color: #64748b;
-    }
-
-    .ipfs-drop-zone {
-      border: 2px dashed #1e293b;
-      border-radius: 8px;
-      padding: 32px 16px;
-      text-align: center;
-      cursor: pointer;
-      transition: border-color 0.2s, background 0.2s;
-      margin-bottom: 16px;
-    }
-    .ipfs-drop-zone:hover,
-    .ipfs-drop-zone.drag-over {
-      border-color: #3b82f6;
-      background: #0f1f3d;
-    }
-    .ipfs-drop-zone .icon { font-size: 32px; margin-bottom: 8px; }
-    .ipfs-drop-zone .hint { font-size: 13px; color: #64748b; }
-    .ipfs-drop-zone .hint strong { color: #94a3b8; }
-
-    .ipfs-file-input { display: none; }
-
-    .ipfs-progress {
-      display: none;
-      margin-bottom: 16px;
-    }
-    .ipfs-progress.active { display: block; }
-    .ipfs-progress-bar-bg {
-      background: #1e293b;
-      border-radius: 4px;
-      height: 6px;
-      overflow: hidden;
-      margin-bottom: 8px;
-    }
-    .ipfs-progress-bar {
-      height: 100%;
-      background: linear-gradient(90deg, #3b82f6, #06b6d4);
-      border-radius: 4px;
-      transition: width 0.3s;
-      width: 0%;
-    }
-    .ipfs-progress-msg { font-size: 12px; color: #64748b; }
-
-    .ipfs-result {
-      display: none;
-      background: #0d2137;
-      border: 1px solid #1e4976;
-      border-radius: 8px;
-      padding: 12px;
-      margin-bottom: 16px;
-    }
-    .ipfs-result.active { display: block; }
-    .ipfs-result .cid {
-      font-family: monospace;
-      font-size: 11px;
-      color: #60a5fa;
-      word-break: break-all;
-      margin: 4px 0 8px;
-    }
-    .ipfs-result .links { display: flex; gap: 8px; flex-wrap: wrap; }
-    .ipfs-result a {
-      font-size: 11px;
-      color: #3b82f6;
-      text-decoration: none;
-    }
-    .ipfs-result a:hover { text-decoration: underline; }
-
-    .ipfs-actions { display: flex; gap: 8px; justify-content: flex-end; }
-    .ipfs-btn-cancel {
-      background: #1e293b;
-      border: none;
-      color: #94a3b8;
-      border-radius: 6px;
-      padding: 8px 16px;
-      cursor: pointer;
-      font-size: 13px;
-    }
-    .ipfs-btn-cancel:hover { background: #263548; }
-    .ipfs-btn-send {
-      background: #3b82f6;
-      border: none;
-      color: #fff;
-      border-radius: 6px;
-      padding: 8px 16px;
-      cursor: pointer;
-      font-size: 13px;
-      font-weight: 600;
-      display: none;
-    }
-    .ipfs-btn-send.active { display: block; }
-    .ipfs-btn-send:hover { background: #2563eb; }
-
-    .ipfs-error {
-      display: none;
-      background: #2d1010;
-      border: 1px solid #7f1d1d;
-      border-radius: 6px;
-      padding: 10px 12px;
-      font-size: 12px;
-      color: #fca5a5;
-      margin-bottom: 12px;
-    }
-    .ipfs-error.active { display: block; }
-  `;
-  document.head.appendChild(style);
-
-  // ── DOM ──
-  const btn = document.createElement('button');
-  btn.className = 'ipfs-btn';
-  btn.title = 'Attach file (encrypted IPFS)';
-  btn.innerHTML = '📎';
-
-  const overlay = document.createElement('div');
-  overlay.className = 'ipfs-modal-overlay';
-  overlay.innerHTML = `
-    <div class="ipfs-modal">
-      <h3>📎 Attach File</h3>
-      <p class="sub">Encrypted with your wallet key · Stored on IPFS</p>
-
-      <div class="ipfs-drop-zone" id="ipfs-drop">
-        <div class="icon">🔐</div>
-        <div class="hint">Drop a file here or <strong>click to browse</strong></div>
-        <input type="file" class="ipfs-file-input" id="ipfs-file-input">
-      </div>
-
-      <div class="ipfs-error" id="ipfs-error"></div>
-
-      <div class="ipfs-progress" id="ipfs-progress">
-        <div class="ipfs-progress-bar-bg">
-          <div class="ipfs-progress-bar" id="ipfs-bar"></div>
-        </div>
-        <div class="ipfs-progress-msg" id="ipfs-msg">Preparing...</div>
-      </div>
-
-      <div class="ipfs-result" id="ipfs-result">
-        <div style="font-size:12px;color:#94a3b8;margin-bottom:4px;">✅ Uploaded</div>
-        <div class="cid" id="ipfs-cid"></div>
-        <div class="links">
-          <a id="ipfs-vault-link" href="#" target="_blank">🔓 Decrypt at vault.x1.xyz</a>
-          <a id="ipfs-raw-link" href="#" target="_blank">📦 Raw IPFS</a>
-        </div>
-      </div>
-
-      <div class="ipfs-actions">
-        <button class="ipfs-btn-cancel" id="ipfs-cancel">Cancel</button>
-        <button class="ipfs-btn-send" id="ipfs-send">Send in Chat ↑</button>
-      </div>
-    </div>
-  `;
-  document.body.appendChild(overlay);
-
-  // ── Elements ──
-  const dropZone    = overlay.querySelector('#ipfs-drop');
-  const fileInput   = overlay.querySelector('#ipfs-file-input');
-  const errorEl     = overlay.querySelector('#ipfs-error');
-  const progressEl  = overlay.querySelector('#ipfs-progress');
-  const barEl       = overlay.querySelector('#ipfs-bar');
-  const msgEl       = overlay.querySelector('#ipfs-msg');
-  const resultEl    = overlay.querySelector('#ipfs-result');
-  const cidEl       = overlay.querySelector('#ipfs-cid');
-  const vaultLink   = overlay.querySelector('#ipfs-vault-link');
-  const rawLink     = overlay.querySelector('#ipfs-raw-link');
-  const cancelBtn   = overlay.querySelector('#ipfs-cancel');
-  const sendBtn     = overlay.querySelector('#ipfs-send');
-
-  let lastResult = null;
-
-  const uploader = new XChatIPFSUploader({
-    walletProvider,
-    walletAddress,
-    onProgress({ pct, msg }) {
-      progressEl.classList.add('active');
-      barEl.style.width = pct + '%';
-      msgEl.textContent = msg;
-    },
-    onComplete(result) {
-      lastResult = result;
-      cidEl.textContent = result.cid;
-      vaultLink.href = result.vaultUrl;
-      rawLink.href = result.decryptUrl;
-      resultEl.classList.add('active');
-      sendBtn.classList.add('active');
-      progressEl.classList.remove('active');
-    },
-    onError(err) {
-      errorEl.textContent = '⚠️ ' + err.message;
-      errorEl.classList.add('active');
-      progressEl.classList.remove('active');
-    },
-  });
-
-  function reset() {
-    errorEl.classList.remove('active');
-    progressEl.classList.remove('active');
-    resultEl.classList.remove('active');
-    sendBtn.classList.remove('active');
-    barEl.style.width = '0%';
-    lastResult = null;
-    fileInput.value = '';
-  }
-
-  function openModal() { overlay.classList.add('open'); reset(); }
-  function closeModal() { overlay.classList.remove('open'); reset(); }
-
-  async function handleFile(file) {
-    if (!file) return;
-    reset();
-    errorEl.classList.remove('active');
-    try {
-      await uploader.upload(file);
-    } catch (_) { /* onError handles it */ }
-  }
-
-  // ── Events ──
-  btn.addEventListener('click', openModal);
-  cancelBtn.addEventListener('click', closeModal);
-  overlay.addEventListener('click', e => { if (e.target === overlay) closeModal(); });
-
-  dropZone.addEventListener('click', () => fileInput.click());
-  fileInput.addEventListener('change', e => handleFile(e.target.files[0]));
-
-  dropZone.addEventListener('dragover', e => {
-    e.preventDefault();
-    dropZone.classList.add('drag-over');
-  });
-  dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
-  dropZone.addEventListener('drop', e => {
-    e.preventDefault();
-    dropZone.classList.remove('drag-over');
-    handleFile(e.dataTransfer.files[0]);
-  });
-
-  sendBtn.addEventListener('click', () => {
-    if (lastResult && onShareMessage) {
-      onShareMessage(lastResult.shareMessage, lastResult);
-    }
-    closeModal();
-  });
-
-  return { btn, destroy: () => { overlay.remove(); style.remove(); } };
+    return { bytes: plaintext, name, mime };
 }
 
-// ── Export ────────────────────────────────────────────────────────────────────
-export { XChatIPFSUploader, createUploaderUI, buildShareMessage };
+/**
+ * Trigger a browser download of decrypted file bytes.
+ */
+export function downloadFile(bytes, name, mime) {
+    const blob = new Blob([bytes], { type: mime });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
+
+/**
+ * Check if a parsed message payload is an xchat-file attachment.
+ */
+export function isFileAttachment(payload) {
+    return payload && payload.type === 'xchat-file-v1' && payload.cid && payload.name;
+}
