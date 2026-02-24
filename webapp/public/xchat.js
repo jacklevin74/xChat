@@ -455,6 +455,10 @@ async function processIncomingMessage(msg) {
     if (state.seenMessageIds.has(msg.id)) {
         return null;
     }
+    // Filter locally-deleted messages — don't re-add them from server history
+    if (loadDeletedIds().has(msg.id)) {
+        return null;
+    }
     state.seenMessageIds.add(msg.id);
 
     try {
@@ -1533,12 +1537,34 @@ window.toggleReaction = function(msgId, emoji) {
     persistReactions();
 };
 
+function getDeletedMsgKey() {
+    return state.wallet ? `x1msg-deleted-${state.wallet}` : null;
+}
+
+function loadDeletedIds() {
+    const key = getDeletedMsgKey();
+    if (!key) return new Set();
+    try { return new Set(JSON.parse(localStorage.getItem(key) || '[]')); }
+    catch (e) { return new Set(); }
+}
+
+function saveDeletedId(msgId) {
+    const key = getDeletedMsgKey();
+    if (!key) return;
+    const ids = loadDeletedIds();
+    ids.add(msgId);
+    // Keep max 500 deleted IDs to avoid localStorage bloat
+    const arr = [...ids].slice(-500);
+    try { localStorage.setItem(key, JSON.stringify(arr)); } catch (e) {}
+}
+
 function deleteMessage(msgId) {
     if (!state.activeChat) return;
     const msgs = state.messages.get(state.activeChat);
     if (!msgs) return;
     const idx = msgs.findIndex(m => m.id === msgId);
     if (idx !== -1) msgs.splice(idx, 1);
+    saveDeletedId(msgId);  // Persist so it stays deleted after reconnect
     renderMessages();
     showToast('Message deleted', 'success');
 }
@@ -2136,7 +2162,6 @@ window.connectWallet = async function() {
 
         // Restore this wallet's context (or initialise a clean slate)
         loadWalletState(walletAddress);
-        restoreReactions(walletAddress);
         loadReadMessages();
 
         // Check for cached signature
@@ -2179,6 +2204,7 @@ window.connectWallet = async function() {
         document.getElementById('connectOverlay').classList.add('hidden');
         document.getElementById('disconnectBtn')?.classList.remove('hidden');
         updateWalletDisplay();
+        restoreReactions(walletAddress);  // Restore after wallet fully confirmed
         connectSSE();
         showToast('Connected!', 'success');
 
@@ -2230,6 +2256,7 @@ window.disconnectWallet = function() {
     state.lastSyncTimestamp = 0;
     state.readMessageIds.clear();
     state.incomingStreams.clear();
+    messageReactions.clear();
 
     // Clear localStorage
     const cachedWallet = localStorage.getItem('x1msg-wallet');
