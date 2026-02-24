@@ -86,7 +86,8 @@ async function ipfsUpload(ciphertextBytes, filename) {
 }
 
 async function ipfsFetch(cid) {
-    const res = await fetch(`${IPFS_API}/files/${cid}`);
+    // vault.x1.xyz uses the Kubo RPC API — cat is at /api/v0/cat?arg=<cid>
+    const res = await fetch(`${IPFS_API}/api/v0/cat?arg=${encodeURIComponent(cid)}`, { method: 'POST' });
     if (!res.ok) throw new Error(`IPFS fetch failed (${res.status})`);
     return new Uint8Array(await res.arrayBuffer());
 }
