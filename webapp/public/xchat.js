@@ -1958,13 +1958,21 @@ window.handleKeyDown = function(event) {
     }
 };
 
-// Auto-resize textarea
+// Auto-resize textarea — show scrollbar only when multiline
 document.addEventListener('DOMContentLoaded', () => {
     const textarea = document.getElementById('messageInput');
     if (textarea) {
-        textarea.addEventListener('input', function() {
+        const resize = function() {
             this.style.height = 'auto';
-            this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+            const newHeight = Math.min(this.scrollHeight, 120);
+            this.style.height = newHeight + 'px';
+            // Show scrollbar only when content exceeds max-height
+            this.style.overflowY = this.scrollHeight > 120 ? 'auto' : 'hidden';
+        };
+        textarea.addEventListener('input', resize);
+        // Also handle paste
+        textarea.addEventListener('paste', function() {
+            setTimeout(() => resize.call(this), 0);
         });
     }
 });
