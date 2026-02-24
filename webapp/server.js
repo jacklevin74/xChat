@@ -136,9 +136,16 @@ app.get(['/xchat/', '/xchat2/'], (req, res) => {
     res.sendFile(join(__dirname, 'public', 'xchat.html'));
 });
 
-// Serve static files under /xchat2/ for proxy compatibility
-app.use('/xchat2', express.static(join(__dirname, 'public')));
-app.use(express.static(join(__dirname, 'public')));
+// Serve static files — JS/CSS never cached so updates take effect immediately
+const staticOpts = {
+    setHeaders: (res, filePath) => {
+        if (filePath.endsWith('.js') || filePath.endsWith('.css')) {
+            res.setHeader('Cache-Control', 'no-store');
+        }
+    }
+};
+app.use('/xchat2', express.static(join(__dirname, 'public'), staticOpts));
+app.use(express.static(join(__dirname, 'public'), staticOpts));
 
 // CORS
 app.use((req, res, next) => {
