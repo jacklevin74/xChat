@@ -614,8 +614,8 @@ app.post('/api/lattice/handshake/initiate', (req, res) => {
     const id = Buffer.from(`${initiator}:${responder}:${Date.now()}`).toString('base64url').slice(0, 32);
     latticeStmts.createHS.run(id, initiator, responder, kemPublicKey);
     // Notify responder via SSE if they're connected
-    const responderClients = clients.get(responder) || [];
-    responderClients.forEach(c => c.write(`data: ${JSON.stringify({ type: 'lattice_handshake_request', handshakeId: id, from: initiator })}\n\n`));
+    const _respClients = sseClients.get(responder);
+    if (_respClients) _respClients.forEach(c => c.write(`data: ${JSON.stringify({ type: 'lattice_handshake_request', handshakeId: id, from: initiator })}\n\n`));
     console.log(`[Lattice] Handshake initiated: ${initiator.slice(0, 8)} → ${responder.slice(0, 8)} (id=${id})`);
     res.json({ success: true, handshakeId: id });
 });
@@ -638,8 +638,8 @@ app.post('/api/lattice/handshake/:id/respond', (req, res) => {
     }
     latticeStmts.completeHS.run(ciphertext, id);
     // Notify initiator via SSE
-    const initiatorClients = clients.get(hs.initiator) || [];
-    initiatorClients.forEach(c => c.write(`data: ${JSON.stringify({ type: 'lattice_handshake_completed', handshakeId: id, from: responder })}\n\n`));
+    const _initClients = sseClients.get(hs.initiator);
+    if (_initClients) _initClients.forEach(c => c.write(`data: ${JSON.stringify({ type: 'lattice_handshake_completed', handshakeId: id, from: responder })}\n\n`));
     console.log(`[Lattice] Handshake completed: ${responder.slice(0, 8)} responded to ${hs.initiator.slice(0, 8)} (id=${id})`);
     res.json({ success: true });
 });
@@ -671,8 +671,8 @@ app.post('/api/lattice/handshake/:id/acknowledge', (req, res) => {
     if (hs.status !== 'completed') return res.status(409).json({ error: `Handshake is '${hs.status}', not 'completed'` });
     latticeStmts.acknowledgeHS.run(id);
     // Notify responder that both parties are ready
-    const responderClients = clients.get(hs.responder) || [];
-    responderClients.forEach(c => c.write(`data: ${JSON.stringify({ type: 'lattice_handshake_acknowledged', handshakeId: id, from: initiator })}\n\n`));
+    const _ackClients = sseClients.get(hs.responder);
+    if (_ackClients) _ackClients.forEach(c => c.write(`data: ${JSON.stringify({ type: 'lattice_handshake_acknowledged', handshakeId: id, from: initiator })}\n\n`));
     console.log(`[Lattice] Handshake acknowledged: ${initiator.slice(0, 8)} ↔ ${hs.responder.slice(0, 8)} — secure channel established`);
     res.json({ success: true });
 });
