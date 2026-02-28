@@ -599,6 +599,7 @@ function connectSSE() {
         try {
             const data = JSON.parse(event.data);
 
+            if (data.type?.startsWith('lattice_')) { await handleLatticeSSEEvent(data); return; }
             if (data.type === 'connected') {
                 updateConnectionStatus(true);
                 console.log(`[SSE] Connected, syncing ${data.messageCount ?? '?'} messages since ${data.since ?? 0}`);
@@ -1344,6 +1345,7 @@ window.selectChat = function(address) {
             messageInput.placeholder = 'Type a message...';
             messageInput.focus();
         }
+    _updateLatticeUI(address);
     } catch (e) {
         console.error('[selectChat] Error:', e);
     }
@@ -2053,7 +2055,16 @@ window.sendMessage = async function() {
 
         // Backward-compat: pure text stays as plain string, not JSON
         const finalContent = fileData ? JSON.stringify(messagePayload) : content;
-        const plaintext = new TextEncoder().encode(finalContent);
+        // Post-quantum: wrap inner payload with ML-KEM-768 if session exists
+        let _pqContent = finalContent;
+        const _lSecret = state.latticeSessions?.get(state.activeChat);
+        if (_lSecret) {
+            try {
+                const { iv, ct } = await _latticeEncrypt(_lSecret, new TextEncoder().encode(finalContent));
+                _pqContent = LATTICE_MSG_PREFIX + _b2hex(iv) + ':' + _b2hex(ct);
+            } catch(_le) { console.warn('[Lattice] Encrypt failed, using X25519 only'); }
+        }
+        const plaintext = new TextEncoder().encode(_pqContent);
 
         if (plaintext.length > STREAM_CHUNK_SIZE) {
             const streamId = generateStreamId();
@@ -2289,6 +2300,8 @@ window.connectWallet = async function() {
         restoreReactions(walletAddress);  // Restore after wallet fully confirmed
         connectSSE();
         showToast('Connected!', 'success');
+        registerKemKey(state.wallet).catch(()=>{});
+        checkPendingLatticeHandshakes().catch(()=>{});
 
     } catch (e) {
         // Reset overlay to initial state
