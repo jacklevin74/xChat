@@ -1,16 +1,18 @@
-// X1 Encrypted Messaging Server - Secure Version with SSE + SQLite
+// X1 Encrypted Messaging Server v3 - Bidirectional File Exchange via Handshake PDA
 import express from 'express';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { readFileSync, existsSync } from 'fs';
 import { createServer } from 'https';
+import http from 'http';
+import httpsModule from 'https';
 import { ed25519 } from '@noble/curves/ed25519';
 import Database from 'better-sqlite3';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
-const PORT = process.env.PORT || 3001;
-const HTTPS_PORT = process.env.HTTPS_PORT || 3443;
+const PORT = process.env.PORT || 3999;
+const HTTPS_PORT = process.env.HTTPS_PORT || 4443;
 const TLS_CERT = process.env.TLS_CERT || '/tmp/xchat-cert.pem';
 const TLS_KEY = process.env.TLS_KEY || '/tmp/xchat-key.pem';
 
@@ -40,23 +42,64 @@ db.exec(`
         is_final BOOLEAN DEFAULT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS shared_files (
+        id TEXT PRIMARY KEY,
+        cid TEXT NOT NULL UNIQUE,
+        filename TEXT NOT NULL,
+        sender_wallet TEXT NOT NULL,
+        recipient_wallet TEXT NOT NULL,
+        handshake_pda TEXT NOT NULL,
+        timestamp INTEGER NOT NULL,
+        kem_variant INTEGER NOT NULL DEFAULT 1,
+        file_size INTEGER DEFAULT 0,
+        mime_type TEXT DEFAULT 'application/octet-stream'
+    );
+
+    CREATE TABLE IF NOT EXISTS bookmarks (
+        id TEXT PRIMARY KEY,
+        owner_wallet TEXT NOT NULL,
+        cid TEXT NOT NULL,
+        filename TEXT NOT NULL,
+        mime_type TEXT DEFAULT 'application/octet-stream',
+        file_size INTEGER DEFAULT 0,
+        iv TEXT NOT NULL,
+        timestamp INTEGER NOT NULL,
+        label TEXT DEFAULT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_bookmarks_owner ON bookmarks(owner_wallet, timestamp);
+
     CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient, created_at);
     CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender);
+    CREATE INDEX IF NOT EXISTS idx_shared_files_pda ON shared_files(handshake_pda, timestamp);
+    CREATE INDEX IF NOT EXISTS idx_shared_files_cid ON shared_files(cid);
 `);
 
 // Add read_at column if it doesn't exist (migration for existing DBs)
-try {
-    db.exec('ALTER TABLE messages ADD COLUMN read_at INTEGER DEFAULT NULL');
-} catch (e) {
-    // Column already exists
-}
-
-// Add streaming columns if they don't exist
+try { db.exec('ALTER TABLE messages ADD COLUMN read_at INTEGER DEFAULT NULL'); } catch (e) {}
 try { db.exec('ALTER TABLE messages ADD COLUMN stream_id TEXT DEFAULT NULL'); } catch (e) {}
 try { db.exec('ALTER TABLE messages ADD COLUMN chunk_index INTEGER DEFAULT NULL'); } catch (e) {}
 try { db.exec('ALTER TABLE messages ADD COLUMN chunk_total INTEGER DEFAULT NULL'); } catch (e) {}
 try { db.exec('ALTER TABLE messages ADD COLUMN is_final BOOLEAN DEFAULT NULL'); } catch (e) {}
 try { db.exec('CREATE INDEX IF NOT EXISTS idx_messages_stream_id ON messages(stream_id)'); } catch (e) {}
+
+// Add bookmarks table migration for existing DBs
+try {
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS bookmarks (
+            id TEXT PRIMARY KEY,
+            owner_wallet TEXT NOT NULL,
+            cid TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            mime_type TEXT DEFAULT 'application/octet-stream',
+            file_size INTEGER DEFAULT 0,
+            iv TEXT NOT NULL,
+            timestamp INTEGER NOT NULL,
+            label TEXT DEFAULT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_bookmarks_owner ON bookmarks(owner_wallet, timestamp);
+    `);
+} catch (e) {}
 
 // Prepared statements
 const stmts = {
@@ -73,6 +116,17 @@ const stmts = {
     getAllMessages: db.prepare('SELECT * FROM messages ORDER BY created_at ASC'),
     markMessagesRead: db.prepare('UPDATE messages SET read_at = ? WHERE id IN (SELECT value FROM json_each(?)) AND recipient = ? AND read_at IS NULL'),
     getMessageById: db.prepare('SELECT * FROM messages WHERE id = ?'),
+
+    // Shared files
+    insertSharedFile: db.prepare('INSERT OR REPLACE INTO shared_files (id, cid, filename, sender_wallet, recipient_wallet, handshake_pda, timestamp, kem_variant, file_size, mime_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'),
+    getFilesByPda: db.prepare('SELECT * FROM shared_files WHERE handshake_pda = ? ORDER BY timestamp ASC'),
+    getFileByCid: db.prepare('SELECT * FROM shared_files WHERE cid = ?'),
+    deleteFileByCid: db.prepare('DELETE FROM shared_files WHERE cid = ?'),
+
+    // Bookmarks (private file storage)
+    insertBookmark: db.prepare('INSERT INTO bookmarks (id, owner_wallet, cid, filename, mime_type, file_size, iv, timestamp, label) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'),
+    getBookmarks: db.prepare('SELECT * FROM bookmarks WHERE owner_wallet = ? ORDER BY timestamp DESC'),
+    deleteBookmark: db.prepare('DELETE FROM bookmarks WHERE id = ? AND owner_wallet = ?'),
 };
 
 // SSE clients (in-memory, not persisted)
@@ -116,24 +170,24 @@ function base58Decode(str) {
 // Middleware
 app.use(express.json());
 
-// Rewrite /xchat/api/* or /xchat2/api/* to /api/* for proxy compatibility
+// Rewrite /xchat/api/* or /xchat2/api/* or /xchat3/api/* to /api/* for proxy compatibility
 app.use((req, res, next) => {
-    if (req.path.startsWith('/xchat/api/') || req.path.startsWith('/xchat2/api/')) {
-        req.url = req.url.replace(/^\/xchat2?\/api\//, '/api/');
+    if (req.path.startsWith('/xchat/api/') || req.path.startsWith('/xchat2/api/') || req.path.startsWith('/xchat3/api/')) {
+        req.url = req.url.replace(/^\/xchat[23]?\/api\//, '/api/');
     }
     next();
 });
 
-// Redirect /xchat2 to /xchat2/ so relative paths resolve correctly
-app.get(['/xchat', '/xchat2'], (req, res) => {
+// Redirect /xchat3 to /xchat3/ so relative paths resolve correctly
+app.get(['/xchat', '/xchat2', '/xchat3'], (req, res) => {
     if (!req.originalUrl.endsWith('/') && !req.originalUrl.includes('?')) {
         return res.redirect(301, req.originalUrl + '/');
     }
     res.sendFile(join(__dirname, 'public', 'xchat.html'));
 });
 
-// Also serve the HTML at /xchat2/ (with trailing slash)
-app.get(['/xchat/', '/xchat2/'], (req, res) => {
+// Also serve the HTML at /xchat3/ (with trailing slash)
+app.get(['/xchat/', '/xchat2/', '/xchat3/'], (req, res) => {
     res.sendFile(join(__dirname, 'public', 'xchat.html'));
 });
 
@@ -145,24 +199,14 @@ const staticOpts = {
         }
     }
 };
+app.use('/xchat3', express.static(join(__dirname, 'public'), staticOpts));
 app.use('/xchat2', express.static(join(__dirname, 'public'), staticOpts));
 app.use(express.static(join(__dirname, 'public'), staticOpts));
-
-// Serve @noble/post-quantum for ML-KEM-768 in browser
-app.use('/node_modules/@noble/post-quantum', express.static(
-    join(__dirname, '../node_modules/@noble/post-quantum'),
-    { maxAge: '1d' }
-));
-// Also serve @noble/hashes (dependency of post-quantum)
-app.use('/node_modules/@noble/hashes', express.static(
-    join(__dirname, '../node_modules/@noble/hashes'),
-    { maxAge: '1d' }
-));
 
 // CORS
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
     res.header('Access-Control-Allow-Headers', 'Content-Type');
     if (req.method === 'OPTIONS') return res.sendStatus(200);
     next();
@@ -323,23 +367,13 @@ app.post('/api/messages', (req, res) => {
         readAt: null,
     };
 
-    // Store message in SQLite
     stmts.insertMessage.run(
-        message.id,
-        from,
-        to,
-        nonce,
-        ciphertext,
-        message.timestamp,
-        message.stream_id,
-        message.chunk_index,
-        message.chunk_total,
-        message.is_final
+        message.id, from, to, nonce, ciphertext, message.timestamp,
+        message.stream_id, message.chunk_index, message.chunk_total, message.is_final
     );
 
     const eventType = message.stream_id ? 'stream_chunk' : 'message';
 
-    // Push to connected SSE clients
     const clients = sseClients.get(to);
     if (clients && clients.size > 0) {
         const data = JSON.stringify({ type: eventType, message });
@@ -354,7 +388,6 @@ app.post('/api/messages', (req, res) => {
     res.json({ success: true, id: message.id });
 });
 
-// Mark messages as read - sends read receipt to sender
 app.post('/api/messages/read', (req, res) => {
     const { reader, messageIds } = req.body;
     if (!reader || !messageIds || !Array.isArray(messageIds) || messageIds.length === 0) {
@@ -363,7 +396,6 @@ app.post('/api/messages/read', (req, res) => {
 
     const now = Date.now();
 
-    // Get messages that will be marked as read (to notify senders)
     const messagesToNotify = [];
     for (const id of messageIds) {
         const msg = stmts.getMessageById.get(id);
@@ -372,22 +404,16 @@ app.post('/api/messages/read', (req, res) => {
         }
     }
 
-    // Mark messages as read in database
     const result = stmts.markMessagesRead.run(now, JSON.stringify(messageIds), reader);
     console.log(`[Read] ${reader.slice(0, 8)}... marked ${result.changes} messages as read`);
 
-    // Notify senders via SSE
-    console.log(`[Read] Notifying ${messagesToNotify.length} senders`);
     for (const { id, sender } of messagesToNotify) {
         const clients = sseClients.get(sender);
         if (clients && clients.size > 0) {
             const data = JSON.stringify({ type: 'read_receipt', messageId: id, readAt: now });
-            console.log(`[Read] Sending read_receipt to ${sender.slice(0, 8)}... for msg ${id}`);
             for (const client of clients) {
                 client.write(`data: ${data}\n\n`);
             }
-        } else {
-            console.log(`[Read] Sender ${sender.slice(0, 8)}... not connected`);
         }
     }
 
@@ -398,12 +424,8 @@ app.get('/api/messages/:address', (req, res) => {
     const since = parseInt(req.query.since) || 0;
     const rows = stmts.getMessages.all(req.params.address, since);
     const messages = rows.map(r => ({
-        id: r.id,
-        from: r.sender,
-        to: r.recipient,
-        nonce: r.nonce,
-        ciphertext: r.ciphertext,
-        timestamp: r.created_at,
+        id: r.id, from: r.sender, to: r.recipient,
+        nonce: r.nonce, ciphertext: r.ciphertext, timestamp: r.created_at,
         readAt: r.read_at || null,
         stream_id: r.stream_id || null,
         chunk_index: r.chunk_index ?? null,
@@ -413,36 +435,25 @@ app.get('/api/messages/:address', (req, res) => {
     res.json({ messages });
 });
 
-// Delete message history - requires signature proof
 app.delete('/api/messages/:address', (req, res) => {
     const address = req.params.address;
     const { signature } = req.body;
 
-    if (!signature) {
-        return res.status(400).json({ error: 'Missing signature' });
-    }
+    if (!signature) return res.status(400).json({ error: 'Missing signature' });
 
     try {
         const walletPubKey = base58Decode(address);
-        if (walletPubKey.length !== 32) {
-            return res.status(400).json({ error: 'Invalid address' });
-        }
+        if (walletPubKey.length !== 32) return res.status(400).json({ error: 'Invalid address' });
 
         const signatureBytes = base58Decode(signature);
-        if (signatureBytes.length !== 64) {
-            return res.status(400).json({ error: 'Invalid signature' });
-        }
+        if (signatureBytes.length !== 64) return res.status(400).json({ error: 'Invalid signature' });
 
-        // Verify signature on deletion request
         const messageText = `X1 Messaging: Delete my message history`;
         const messageBytes = new TextEncoder().encode(messageText);
         const isValid = ed25519.verify(signatureBytes, messageBytes, walletPubKey);
 
-        if (!isValid) {
-            return res.status(401).json({ error: 'Invalid signature' });
-        }
+        if (!isValid) return res.status(401).json({ error: 'Invalid signature' });
 
-        // If peer provided, delete only that conversation; otherwise delete all
         const { peer } = req.body;
         let deletedCount;
         if (peer && typeof peer === 'string') {
@@ -450,12 +461,11 @@ app.delete('/api/messages/:address', (req, res) => {
             if (peerKey.length !== 32) return res.status(400).json({ error: 'Invalid peer address' });
             const result = stmts.deleteConversation.run(address, peer, peer, address);
             deletedCount = result.changes;
-            console.log(`[Msg] Deleted ${deletedCount} messages between ${address.slice(0,8)}... and ${peer.slice(0,8)}...`);
         } else {
             const result = stmts.deleteUserMessages.run(address, address);
             deletedCount = result.changes;
-            console.log(`[Msg] Deleted ${deletedCount} messages for ${address.slice(0,8)}...`);
         }
+        console.log(`[Msg] Deleted ${deletedCount} messages for ${address.slice(0,8)}...`);
         res.json({ success: true, deleted: deletedCount });
 
     } catch (e) {
@@ -464,14 +474,6 @@ app.delete('/api/messages/:address', (req, res) => {
     }
 });
 
-// NOTE: File storage removed. All file transfers use IPFS (vault.x1.xyz).
-// Files are encrypted client-side with the X25519 shared secret before upload.
-// The server never sees file contents or handles file storage.
-
-// ============================================================================
-// SINGLE MESSAGE DELETE
-// ============================================================================
-
 app.delete('/api/messages/single/:id', (req, res) => {
     const { id } = req.params;
     const { senderAddress } = req.body;
@@ -479,15 +481,12 @@ app.delete('/api/messages/single/:id', (req, res) => {
     if (!senderAddress) return res.status(400).json({ error: 'Missing senderAddress' });
 
     try {
-        // Verify message exists and belongs to requester
         const msg = stmts.getMessageById.get(id);
         if (!msg) return res.status(404).json({ error: 'Message not found' });
         if (msg.sender !== senderAddress) return res.status(403).json({ error: 'Not your message' });
 
-        // Delete it
         db.prepare('DELETE FROM messages WHERE id = ?').run(id);
 
-        // Push message_deleted event to recipient via SSE
         const recipientClients = sseClients.get(msg.recipient);
         if (recipientClients) {
             const event = JSON.stringify({ type: 'message_deleted', id });
@@ -496,7 +495,6 @@ app.delete('/api/messages/single/:id', (req, res) => {
             }
         }
 
-        console.log(`[Msg] Single delete: ${id.slice(0,8)}... by ${senderAddress.slice(0,8)}...`);
         res.json({ success: true });
     } catch (e) {
         console.error('[Msg] Single delete error:', e.message);
@@ -505,7 +503,161 @@ app.delete('/api/messages/single/:id', (req, res) => {
 });
 
 // ============================================================================
+// SHARED FILES (Bidirectional file discovery via Handshake PDA)
+// ============================================================================
+
+// POST /api/files — Register a file in the shared session
+app.post('/api/files', (req, res) => {
+    const { cid, filename, senderWallet, recipientWallet, handshakePda, kemVariant, fileSize, mimeType } = req.body;
+
+    if (!cid || !filename || !senderWallet || !recipientWallet || !handshakePda) {
+        return res.status(400).json({ error: 'Missing required fields: cid, filename, senderWallet, recipientWallet, handshakePda' });
+    }
+
+    // Validate wallets are plausible base58 strings (basic sanity check)
+    if (typeof senderWallet !== 'string' || senderWallet.length < 32) {
+        return res.status(400).json({ error: 'Invalid senderWallet' });
+    }
+
+    try {
+        const id = Date.now().toString(36) + Math.random().toString(36).slice(2);
+        const timestamp = Date.now();
+        const variant = Number.isFinite(Number(kemVariant)) ? Number(kemVariant) : 1;
+        const size = Number.isFinite(Number(fileSize)) ? Number(fileSize) : 0;
+        const mime = mimeType || 'application/octet-stream';
+
+        stmts.insertSharedFile.run(id, cid, filename, senderWallet, recipientWallet, handshakePda, timestamp, variant, size, mime);
+
+        console.log(`[Files] Registered: ${filename} (${cid.slice(0,8)}...) in PDA ${handshakePda.slice(0,8)}...`);
+
+        // Push SSE notification to both parties
+        const fileEvent = JSON.stringify({
+            type: 'file_shared',
+            file: { id, cid, filename, senderWallet, recipientWallet, handshakePda, timestamp, kemVariant: variant, fileSize: size, mimeType: mime }
+        });
+
+        for (const addr of [senderWallet, recipientWallet]) {
+            const clients = sseClients.get(addr);
+            if (clients && clients.size > 0) {
+                for (const client of clients) {
+                    client.write(`data: ${fileEvent}\n\n`);
+                }
+            }
+        }
+
+        res.json({ success: true, id, timestamp });
+
+    } catch (e) {
+        // Handle UNIQUE constraint on cid (file already registered)
+        if (e.message && e.message.includes('UNIQUE constraint')) {
+            return res.json({ success: true, duplicate: true });
+        }
+        console.error('[Files] Register error:', e.message);
+        res.status(500).json({ error: 'Failed to register file' });
+    }
+});
+
+// GET /api/files/:handshakePda — Fetch all files for a handshake session
+app.get('/api/files/:handshakePda', (req, res) => {
+    try {
+        const rows = stmts.getFilesByPda.all(req.params.handshakePda);
+        const files = rows.map(r => ({
+            id: r.id,
+            cid: r.cid,
+            filename: r.filename,
+            senderWallet: r.sender_wallet,
+            recipientWallet: r.recipient_wallet,
+            handshakePda: r.handshake_pda,
+            timestamp: r.timestamp,
+            kemVariant: r.kem_variant,
+            fileSize: r.file_size,
+            mimeType: r.mime_type,
+        }));
+        res.json({ files });
+    } catch (e) {
+        console.error('[Files] Fetch error:', e.message);
+        res.status(500).json({ error: 'Failed to fetch files' });
+    }
+});
+
+// DELETE /api/files/:cid — Remove a file from the registry (cleanup)
+app.delete('/api/files/:cid', (req, res) => {
+    try {
+        const result = stmts.deleteFileByCid.run(req.params.cid);
+        console.log(`[Files] Deleted: ${req.params.cid.slice(0,8)}... (${result.changes} rows)`);
+        res.json({ success: true, deleted: result.changes });
+    } catch (e) {
+        console.error('[Files] Delete error:', e.message);
+        res.status(500).json({ error: 'Failed to delete file' });
+    }
+});
+
+// ============================================================================
 // DEBUG
+// ============================================================================
+// BOOKMARKS (Private file storage per wallet)
+// ============================================================================
+
+// POST /api/bookmarks — Save a new bookmark
+app.post('/api/bookmarks', (req, res) => {
+    const { owner, cid, filename, mime_type, file_size, iv, label } = req.body;
+
+    if (!owner || !cid || !filename || !iv) {
+        return res.status(400).json({ error: 'Missing required fields: owner, cid, filename, iv' });
+    }
+
+    try {
+        const id = Date.now().toString(36) + Math.random().toString(36).slice(2);
+        const timestamp = Date.now();
+
+        stmts.insertBookmark.run(id, owner, cid, filename, mime_type || 'application/octet-stream', file_size || 0, iv, timestamp, label || null);
+
+        console.log(`[Bookmarks] Saved: ${filename} (${cid.slice(0, 8)}...) for ${owner.slice(0, 8)}...`);
+        res.json({ success: true, id, timestamp });
+    } catch (e) {
+        console.error('[Bookmarks] Save error:', e.message);
+        res.status(500).json({ error: 'Failed to save bookmark' });
+    }
+});
+
+// GET /api/bookmarks/:owner — Get all bookmarks for a wallet
+app.get('/api/bookmarks/:owner', (req, res) => {
+    try {
+        const rows = stmts.getBookmarks.all(req.params.owner);
+        const bookmarks = rows.map(r => ({
+            id: r.id,
+            cid: r.cid,
+            filename: r.filename,
+            mime_type: r.mime_type,
+            file_size: r.file_size,
+            iv: r.iv,
+            timestamp: r.timestamp,
+            label: r.label
+        }));
+        res.json({ bookmarks });
+    } catch (e) {
+        console.error('[Bookmarks] Fetch error:', e.message);
+        res.status(500).json({ error: 'Failed to fetch bookmarks' });
+    }
+});
+
+// DELETE /api/bookmarks/:id — Delete a bookmark
+app.delete('/api/bookmarks/:id', (req, res) => {
+    const { owner } = req.body;
+    if (!owner) {
+        return res.status(400).json({ error: 'Missing owner' });
+    }
+
+    try {
+        const result = stmts.deleteBookmark.run(req.params.id, owner);
+        console.log(`[Bookmarks] Deleted: ${req.params.id} (${result.changes} rows)`);
+        res.json({ success: true, deleted: result.changes });
+    } catch (e) {
+        console.error('[Bookmarks] Delete error:', e.message);
+        res.status(500).json({ error: 'Failed to delete bookmark' });
+    }
+});
+
 // ============================================================================
 
 app.get('/api/debug/dump', (req, res) => {
@@ -527,181 +679,159 @@ app.get('/api/debug/dump', (req, res) => {
 });
 
 // ============================================================================
+// PRIVACY PROXY — strips tracking params, masks user IP from destination
+// ============================================================================
+
+// Native HTTP/HTTPS fetch helper (avoids TLS cert store issues with bare fetch)
+function proxyFetch(url, { timeout = 10000, headers = {} } = {}) {
+    return new Promise((resolve, reject) => {
+        const parsed = new URL(url);
+        const mod = parsed.protocol === 'https:' ? httpsModule : http;
+        const opts = {
+            hostname: parsed.hostname,
+            port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+            path: parsed.pathname + parsed.search,
+            method: 'GET',
+            headers: { 'User-Agent': 'Mozilla/5.0 (compatible; xChat-Privacy-Proxy/1.0)', ...headers },
+            rejectUnauthorized: false,
+            timeout
+        };
+        const req = mod.request(opts, (resp) => {
+            // Follow redirects (up to 5)
+            if ([301,302,303,307,308].includes(resp.statusCode) && resp.headers.location) {
+                proxyFetch(new URL(resp.headers.location, url).toString(), { timeout, headers })
+                    .then(resolve).catch(reject);
+                resp.resume();
+                return;
+            }
+            const chunks = [];
+            resp.on('data', c => chunks.push(c));
+            resp.on('end', () => resolve({ statusCode: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        });
+        req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+        req.on('error', reject);
+        req.end();
+    });
+}
+
+// Simple in-memory rate limiter: 60 req/min per IP
+const proxyRateMap = new Map();
+function proxyRateLimit(ip) {
+    const now = Date.now();
+    const window = 60_000;
+    let entry = proxyRateMap.get(ip);
+    if (!entry || now - entry.ts > window) {
+        entry = { ts: now, count: 0 };
+        proxyRateMap.set(ip, entry);
+    }
+    entry.count++;
+    return entry.count <= 60;
+}
+
+// Block private/internal addresses (SSRF prevention)
+function isPrivateUrl(url) {
+    try {
+        const { hostname } = new URL(url);
+        return /^(localhost|127\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|0\.0\.0\.0|::1|fc00:|fe80:)/i.test(hostname);
+    } catch { return true; }
+}
+
+// Tracking params to strip
+const TRACKING_PARAMS = ['utm_source','utm_medium','utm_campaign','utm_term','utm_content',
+    'fbclid','gclid','gclsrc','dclid','msclkid','twclid','mc_eid','ml_subscriber',
+    'ref','referrer','source','igshid','s_cid','_hsenc','_hsmi','mkt_tok'];
+
+app.get('/api/proxy', async (req, res) => {
+    const clientIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
+    if (!proxyRateLimit(clientIp)) {
+        return res.status(429).json({ error: 'Rate limit exceeded' });
+    }
+
+    const raw = req.query.url;
+    if (!raw || typeof raw !== 'string') {
+        return res.status(400).json({ error: 'Missing url param' });
+    }
+
+    let targetUrl;
+    try {
+        targetUrl = new URL(raw);
+        if (!['http:', 'https:'].includes(targetUrl.protocol)) throw new Error('bad protocol');
+    } catch {
+        return res.status(400).json({ error: 'Invalid URL' });
+    }
+
+    if (isPrivateUrl(raw)) {
+        return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    // Strip tracking params
+    for (const p of TRACKING_PARAMS) targetUrl.searchParams.delete(p);
+
+    proxyFetch(targetUrl.toString(), { timeout: 10000 })
+        .then(({ statusCode, headers, body }) => {
+            const contentType = headers['content-type'] || 'application/octet-stream';
+            res.setHeader('Content-Type', contentType);
+            res.setHeader('X-Proxied-By', 'xChat-Privacy-Proxy');
+            res.setHeader('Cache-Control', 'public, max-age=300');
+            res.status(statusCode).send(body);
+        })
+        .catch(e => {
+            console.error('[Proxy] Error:', e.message);
+            res.status(e.message === 'timeout' ? 504 : 502).json({ error: 'Proxy fetch failed' });
+        });
+});
+
+// OG metadata fetch — server-side, user IP never touches destination
+app.get('/api/og', async (req, res) => {
+    const clientIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
+    if (!proxyRateLimit(clientIp)) return res.status(429).json({ error: 'Rate limit exceeded' });
+
+    const raw = req.query.url;
+    if (!raw) return res.status(400).json({ error: 'Missing url' });
+    if (isPrivateUrl(raw)) return res.status(403).json({ error: 'Forbidden' });
+
+    try {
+        const { body: htmlBuf } = await proxyFetch(raw, { timeout: 8000, headers: { 'Accept': 'text/html' } });
+        const html = htmlBuf.toString('utf8');
+
+        const get = (prop) => {
+            const m = html.match(new RegExp(`<meta[^>]+(?:property|name)=["']${prop}["'][^>]+content=["']([^"']+)["']`, 'i'))
+                     || html.match(new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']${prop}["']`, 'i'));
+            return m?.[1] || '';
+        };
+
+        res.json({
+            title: get('og:title') || html.match(/<title>([^<]+)<\/title>/i)?.[1] || '',
+            description: get('og:description') || get('description'),
+            image: get('og:image'),
+            siteName: get('og:site_name'),
+            url: get('og:url') || raw,
+        });
+    } catch (e) {
+        res.status(e.message === 'timeout' ? 504 : 502).json({ error: 'Fetch failed' });
+    }
+});
+
+// ============================================================================
 // START
 // ============================================================================
 
-
-// ============================================================================
-// LATTICE HANDSHAKE RELAY (ML-KEM-768 / post-quantum)
-// ============================================================================
-// The server is a dumb relay — it never sees private keys or shared secrets.
-// It stores:
-//   - KEM public keys (1184 bytes, hex-encoded) — set by initiator
-//   - Ciphertexts (1088 bytes, hex-encoded) — set by responder
-//   - Handshake status: 'initiated' | 'completed' | 'acknowledged'
-//
-// The actual shared secret is derived entirely off-chain by both parties.
-// ============================================================================
-
-// DB migration: add lattice tables if they don't exist
-db.exec(`
-    CREATE TABLE IF NOT EXISTS lattice_keys (
-        address TEXT PRIMARY KEY,
-        kem_public_key TEXT NOT NULL,
-        created_at INTEGER DEFAULT (strftime('%s', 'now') * 1000)
-    );
-
-    CREATE TABLE IF NOT EXISTS lattice_handshakes (
-        id TEXT PRIMARY KEY,
-        initiator TEXT NOT NULL,
-        responder TEXT NOT NULL,
-        kem_public_key TEXT NOT NULL,
-        ciphertext TEXT,
-        status TEXT NOT NULL DEFAULT 'initiated',
-        created_at INTEGER DEFAULT (strftime('%s', 'now') * 1000),
-        updated_at INTEGER DEFAULT (strftime('%s', 'now') * 1000)
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_lattice_hs_responder ON lattice_handshakes(responder, status);
-    CREATE INDEX IF NOT EXISTS idx_lattice_hs_initiator ON lattice_handshakes(initiator, status);
-`);
-
-const latticeStmts = {
-    setKemKey:     db.prepare('INSERT OR REPLACE INTO lattice_keys (address, kem_public_key) VALUES (?, ?)'),
-    getKemKey:     db.prepare('SELECT kem_public_key FROM lattice_keys WHERE address = ?'),
-    createHS:      db.prepare('INSERT OR REPLACE INTO lattice_handshakes (id, initiator, responder, kem_public_key, status) VALUES (?, ?, ?, ?, \'initiated\')'),
-    getHS:         db.prepare('SELECT * FROM lattice_handshakes WHERE id = ?'),
-    getHSByPair:   db.prepare('SELECT * FROM lattice_handshakes WHERE initiator = ? AND responder = ? ORDER BY created_at DESC LIMIT 1'),
-    getPending:    db.prepare('SELECT * FROM lattice_handshakes WHERE responder = ? AND status = \'initiated\' ORDER BY created_at DESC'),
-    completeHS:    db.prepare('UPDATE lattice_handshakes SET ciphertext = ?, status = \'completed\', updated_at = strftime(\'%s\', \'now\') * 1000 WHERE id = ? AND status = \'initiated\''),
-    acknowledgeHS: db.prepare('UPDATE lattice_handshakes SET status = \'acknowledged\', updated_at = strftime(\'%s\', \'now\') * 1000 WHERE id = ? AND status = \'completed\''),
-};
-
-// POST /api/lattice/keys — register your KEM public key
-app.post('/api/lattice/keys', (req, res) => {
-    const { address, kemPublicKey } = req.body;
-    if (!address || !kemPublicKey) {
-        return res.status(400).json({ error: 'Missing address or kemPublicKey' });
-    }
-    // ML-KEM-768 public key = 1184 bytes = 2368 hex chars
-    const keyBytes = Buffer.from(kemPublicKey, 'hex');
-    if (keyBytes.length !== 1184) {
-        return res.status(400).json({ error: `Invalid KEM public key size: expected 1184 bytes, got ${keyBytes.length}` });
-    }
-    latticeStmts.setKemKey.run(address, kemPublicKey);
-    console.log(`[Lattice] KEM key registered: ${address.slice(0, 8)}...`);
-    res.json({ success: true });
-});
-
-// GET /api/lattice/keys/:address — fetch a peer's KEM public key
-app.get('/api/lattice/keys/:address', (req, res) => {
-    const row = latticeStmts.getKemKey.get(req.params.address);
-    if (!row) return res.status(404).json({ error: 'Not found' });
-    res.json({ address: req.params.address, kemPublicKey: row.kem_public_key });
-});
-
-// POST /api/lattice/handshake/initiate — initiator posts their KEM public key
-app.post('/api/lattice/handshake/initiate', (req, res) => {
-    const { initiator, responder, kemPublicKey } = req.body;
-    if (!initiator || !responder || !kemPublicKey) {
-        return res.status(400).json({ error: 'Missing initiator, responder, or kemPublicKey' });
-    }
-    const keyBytes = Buffer.from(kemPublicKey, 'hex');
-    if (keyBytes.length !== 1184) {
-        return res.status(400).json({ error: 'Invalid KEM public key size' });
-    }
-    // Handshake ID = sha256-ish: sorted addresses + timestamp
-    const id = Buffer.from(`${initiator}:${responder}:${Date.now()}`).toString('base64url').slice(0, 32);
-    latticeStmts.createHS.run(id, initiator, responder, kemPublicKey);
-    // Notify responder via SSE if they're connected
-    const _respClients = sseClients.get(responder);
-    if (_respClients) _respClients.forEach(c => c.write(`data: ${JSON.stringify({ type: 'lattice_handshake_request', handshakeId: id, from: initiator })}\n\n`));
-    console.log(`[Lattice] Handshake initiated: ${initiator.slice(0, 8)} → ${responder.slice(0, 8)} (id=${id})`);
-    res.json({ success: true, handshakeId: id });
-});
-
-// POST /api/lattice/handshake/:id/respond — responder posts ciphertext
-app.post('/api/lattice/handshake/:id/respond', (req, res) => {
-    const { responder, ciphertext } = req.body;
-    const { id } = req.params;
-    if (!responder || !ciphertext) {
-        return res.status(400).json({ error: 'Missing responder or ciphertext' });
-    }
-    const hs = latticeStmts.getHS.get(id);
-    if (!hs) return res.status(404).json({ error: 'Handshake not found' });
-    if (hs.responder !== responder) return res.status(403).json({ error: 'Not your handshake' });
-    if (hs.status !== 'initiated') return res.status(409).json({ error: `Handshake is '${hs.status}', not 'initiated'` });
-    // ML-KEM-768 ciphertext = 1088 bytes = 2176 hex chars
-    const ctBytes = Buffer.from(ciphertext, 'hex');
-    if (ctBytes.length !== 1088) {
-        return res.status(400).json({ error: `Invalid ciphertext size: expected 1088 bytes, got ${ctBytes.length}` });
-    }
-    latticeStmts.completeHS.run(ciphertext, id);
-    // Notify initiator via SSE
-    const _initClients = sseClients.get(hs.initiator);
-    if (_initClients) _initClients.forEach(c => c.write(`data: ${JSON.stringify({ type: 'lattice_handshake_completed', handshakeId: id, from: responder })}\n\n`));
-    console.log(`[Lattice] Handshake completed: ${responder.slice(0, 8)} responded to ${hs.initiator.slice(0, 8)} (id=${id})`);
-    res.json({ success: true });
-});
-
-// GET /api/lattice/handshake/:id — fetch handshake state (poll or after SSE notification)
-app.get('/api/lattice/handshake/:id', (req, res) => {
-    const hs = latticeStmts.getHS.get(req.params.id);
-    if (!hs) return res.status(404).json({ error: 'Not found' });
-    res.json({
-        id: hs.id,
-        initiator: hs.initiator,
-        responder: hs.responder,
-        kemPublicKey: hs.kem_public_key,
-        ciphertext: hs.ciphertext || null,
-        status: hs.status,
-        createdAt: hs.created_at,
-        updatedAt: hs.updated_at,
-    });
-});
-
-// POST /api/lattice/handshake/:id/acknowledge — initiator confirms shared secret established
-app.post('/api/lattice/handshake/:id/acknowledge', (req, res) => {
-    const { initiator } = req.body;
-    const { id } = req.params;
-    if (!initiator) return res.status(400).json({ error: 'Missing initiator' });
-    const hs = latticeStmts.getHS.get(id);
-    if (!hs) return res.status(404).json({ error: 'Handshake not found' });
-    if (hs.initiator !== initiator) return res.status(403).json({ error: 'Not your handshake' });
-    if (hs.status !== 'completed') return res.status(409).json({ error: `Handshake is '${hs.status}', not 'completed'` });
-    latticeStmts.acknowledgeHS.run(id);
-    // Notify responder that both parties are ready
-    const _ackClients = sseClients.get(hs.responder);
-    if (_ackClients) _ackClients.forEach(c => c.write(`data: ${JSON.stringify({ type: 'lattice_handshake_acknowledged', handshakeId: id, from: initiator })}\n\n`));
-    console.log(`[Lattice] Handshake acknowledged: ${initiator.slice(0, 8)} ↔ ${hs.responder.slice(0, 8)} — secure channel established`);
-    res.json({ success: true });
-});
-
-// GET /api/lattice/pending/:address — pending handshake requests for a user
-app.get('/api/lattice/pending/:address', (req, res) => {
-    const rows = latticeStmts.getPending.all(req.params.address);
-    res.json(rows.map(hs => ({
-        id: hs.id,
-        initiator: hs.initiator,
-        kemPublicKey: hs.kem_public_key,
-        createdAt: hs.created_at,
-    })));
-});
-
-console.log('[Lattice] Post-quantum handshake relay loaded (ML-KEM-768)');
-
-
-// HTTP server
 app.listen(PORT, () => {
-    console.log(`\nX1 Encrypted Messaging Server (SSE)`);
-    console.log(`====================================`);
+    console.log(`\nX1 Encrypted Messaging Server v3 (xChat3)`);
+    console.log(`==========================================`);
     console.log(`http://localhost:${PORT}`);
     console.log(`\nEndpoints:`);
-    console.log(`  POST /api/keys        - Register key (with signature)`);
-    console.log(`  GET  /api/keys/:a     - Lookup public key`);
-    console.log(`  GET  /api/stream/:a   - SSE stream for real-time messages`);
-    console.log(`  POST /api/messages    - Send message`);
-    console.log(`  GET  /api/messages/:a - Get messages\n`);
+    console.log(`  POST /api/keys              - Register key (with signature)`);
+    console.log(`  GET  /api/keys/:a           - Lookup public key`);
+    console.log(`  GET  /api/stream/:a         - SSE stream for real-time messages`);
+    console.log(`  POST /api/messages          - Send message`);
+    console.log(`  GET  /api/messages/:a       - Get messages`);
+    console.log(`  POST /api/files             - Register shared file (by handshake PDA)`);
+    console.log(`  GET  /api/files/:pda        - Get all files in a handshake session`);
+    console.log(`  DELETE /api/files/:cid      - Remove file from registry`);
+    console.log(`  POST /api/bookmarks         - Save private bookmark`);
+    console.log(`  GET  /api/bookmarks/:owner  - Get all bookmarks for wallet`);
+    console.log(`  DELETE /api/bookmarks/:id   - Delete bookmark\n`);
 });
 
 // HTTPS server (needed for wallet extensions that require secure context)
@@ -712,9 +842,8 @@ if (existsSync(TLS_CERT) && existsSync(TLS_KEY)) {
     }, app);
     httpsServer.listen(HTTPS_PORT, '127.0.0.1', () => {
         console.log(`HTTPS: https://localhost:${HTTPS_PORT}`);
-        console.log(`(X1 Wallet requires HTTPS for provider injection)\n`);
     });
 } else {
     console.log(`\nNo TLS certs found at ${TLS_CERT} / ${TLS_KEY}`);
-    console.log(`HTTPS disabled. X1 Wallet won't work over plain HTTP.\n`);
+    console.log(`HTTPS disabled.\n`);
 }
