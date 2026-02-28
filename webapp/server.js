@@ -67,7 +67,7 @@ const stmts = {
     insertMessage: db.prepare('INSERT INTO messages (id, sender, recipient, nonce, ciphertext, created_at, stream_id, chunk_index, chunk_total, is_final) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'),
     getMessages: db.prepare('SELECT * FROM messages WHERE recipient = ? AND created_at > ? ORDER BY created_at ASC'),
     getUserMessages: db.prepare('SELECT * FROM messages WHERE sender = ? OR recipient = ? ORDER BY created_at ASC'),
-    getUserMessagesSince: db.prepare('SELECT * FROM messages WHERE (sender = ? OR recipient = ?) AND created_at > ? ORDER BY created_at ASC'),
+    getUserMessagesSince: db.prepare('SELECT * FROM messages WHERE (sender = ? OR recipient = ?) AND created_at >= ? ORDER BY created_at ASC'),
     deleteUserMessages: db.prepare('DELETE FROM messages WHERE sender = ? OR recipient = ?'),
     deleteConversation: db.prepare('DELETE FROM messages WHERE (sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?)'),
     getAllMessages: db.prepare('SELECT * FROM messages ORDER BY created_at ASC'),
@@ -147,6 +147,17 @@ const staticOpts = {
 };
 app.use('/xchat2', express.static(join(__dirname, 'public'), staticOpts));
 app.use(express.static(join(__dirname, 'public'), staticOpts));
+
+// Serve @noble/post-quantum for ML-KEM-768 in browser
+app.use('/node_modules/@noble/post-quantum', express.static(
+    join(__dirname, '../node_modules/@noble/post-quantum'),
+    { maxAge: '1d' }
+));
+// Also serve @noble/hashes (dependency of post-quantum)
+app.use('/node_modules/@noble/hashes', express.static(
+    join(__dirname, '../node_modules/@noble/hashes'),
+    { maxAge: '1d' }
+));
 
 // CORS
 app.use((req, res, next) => {
@@ -458,6 +469,42 @@ app.delete('/api/messages/:address', (req, res) => {
 // The server never sees file contents or handles file storage.
 
 // ============================================================================
+// SINGLE MESSAGE DELETE
+// ============================================================================
+
+app.delete('/api/messages/single/:id', (req, res) => {
+    const { id } = req.params;
+    const { senderAddress } = req.body;
+
+    if (!senderAddress) return res.status(400).json({ error: 'Missing senderAddress' });
+
+    try {
+        // Verify message exists and belongs to requester
+        const msg = stmts.getMessageById.get(id);
+        if (!msg) return res.status(404).json({ error: 'Message not found' });
+        if (msg.sender !== senderAddress) return res.status(403).json({ error: 'Not your message' });
+
+        // Delete it
+        db.prepare('DELETE FROM messages WHERE id = ?').run(id);
+
+        // Push message_deleted event to recipient via SSE
+        const recipientClients = sseClients.get(msg.recipient);
+        if (recipientClients) {
+            const event = JSON.stringify({ type: 'message_deleted', id });
+            for (const client of recipientClients) {
+                client.write(`data: ${event}\n\n`);
+            }
+        }
+
+        console.log(`[Msg] Single delete: ${id.slice(0,8)}... by ${senderAddress.slice(0,8)}...`);
+        res.json({ success: true });
+    } catch (e) {
+        console.error('[Msg] Single delete error:', e.message);
+        res.status(500).json({ error: 'Delete failed' });
+    }
+});
+
+// ============================================================================
 // DEBUG
 // ============================================================================
 
@@ -482,6 +529,167 @@ app.get('/api/debug/dump', (req, res) => {
 // ============================================================================
 // START
 // ============================================================================
+
+
+// ============================================================================
+// LATTICE HANDSHAKE RELAY (ML-KEM-768 / post-quantum)
+// ============================================================================
+// The server is a dumb relay — it never sees private keys or shared secrets.
+// It stores:
+//   - KEM public keys (1184 bytes, hex-encoded) — set by initiator
+//   - Ciphertexts (1088 bytes, hex-encoded) — set by responder
+//   - Handshake status: 'initiated' | 'completed' | 'acknowledged'
+//
+// The actual shared secret is derived entirely off-chain by both parties.
+// ============================================================================
+
+// DB migration: add lattice tables if they don't exist
+db.exec(`
+    CREATE TABLE IF NOT EXISTS lattice_keys (
+        address TEXT PRIMARY KEY,
+        kem_public_key TEXT NOT NULL,
+        created_at INTEGER DEFAULT (strftime('%s', 'now') * 1000)
+    );
+
+    CREATE TABLE IF NOT EXISTS lattice_handshakes (
+        id TEXT PRIMARY KEY,
+        initiator TEXT NOT NULL,
+        responder TEXT NOT NULL,
+        kem_public_key TEXT NOT NULL,
+        ciphertext TEXT,
+        status TEXT NOT NULL DEFAULT 'initiated',
+        created_at INTEGER DEFAULT (strftime('%s', 'now') * 1000),
+        updated_at INTEGER DEFAULT (strftime('%s', 'now') * 1000)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_lattice_hs_responder ON lattice_handshakes(responder, status);
+    CREATE INDEX IF NOT EXISTS idx_lattice_hs_initiator ON lattice_handshakes(initiator, status);
+`);
+
+const latticeStmts = {
+    setKemKey:     db.prepare('INSERT OR REPLACE INTO lattice_keys (address, kem_public_key) VALUES (?, ?)'),
+    getKemKey:     db.prepare('SELECT kem_public_key FROM lattice_keys WHERE address = ?'),
+    createHS:      db.prepare('INSERT OR REPLACE INTO lattice_handshakes (id, initiator, responder, kem_public_key, status) VALUES (?, ?, ?, ?, \'initiated\')'),
+    getHS:         db.prepare('SELECT * FROM lattice_handshakes WHERE id = ?'),
+    getHSByPair:   db.prepare('SELECT * FROM lattice_handshakes WHERE initiator = ? AND responder = ? ORDER BY created_at DESC LIMIT 1'),
+    getPending:    db.prepare('SELECT * FROM lattice_handshakes WHERE responder = ? AND status = \'initiated\' ORDER BY created_at DESC'),
+    completeHS:    db.prepare('UPDATE lattice_handshakes SET ciphertext = ?, status = \'completed\', updated_at = strftime(\'%s\', \'now\') * 1000 WHERE id = ? AND status = \'initiated\''),
+    acknowledgeHS: db.prepare('UPDATE lattice_handshakes SET status = \'acknowledged\', updated_at = strftime(\'%s\', \'now\') * 1000 WHERE id = ? AND status = \'completed\''),
+};
+
+// POST /api/lattice/keys — register your KEM public key
+app.post('/api/lattice/keys', (req, res) => {
+    const { address, kemPublicKey } = req.body;
+    if (!address || !kemPublicKey) {
+        return res.status(400).json({ error: 'Missing address or kemPublicKey' });
+    }
+    // ML-KEM-768 public key = 1184 bytes = 2368 hex chars
+    const keyBytes = Buffer.from(kemPublicKey, 'hex');
+    if (keyBytes.length !== 1184) {
+        return res.status(400).json({ error: `Invalid KEM public key size: expected 1184 bytes, got ${keyBytes.length}` });
+    }
+    latticeStmts.setKemKey.run(address, kemPublicKey);
+    console.log(`[Lattice] KEM key registered: ${address.slice(0, 8)}...`);
+    res.json({ success: true });
+});
+
+// GET /api/lattice/keys/:address — fetch a peer's KEM public key
+app.get('/api/lattice/keys/:address', (req, res) => {
+    const row = latticeStmts.getKemKey.get(req.params.address);
+    if (!row) return res.status(404).json({ error: 'Not found' });
+    res.json({ address: req.params.address, kemPublicKey: row.kem_public_key });
+});
+
+// POST /api/lattice/handshake/initiate — initiator posts their KEM public key
+app.post('/api/lattice/handshake/initiate', (req, res) => {
+    const { initiator, responder, kemPublicKey } = req.body;
+    if (!initiator || !responder || !kemPublicKey) {
+        return res.status(400).json({ error: 'Missing initiator, responder, or kemPublicKey' });
+    }
+    const keyBytes = Buffer.from(kemPublicKey, 'hex');
+    if (keyBytes.length !== 1184) {
+        return res.status(400).json({ error: 'Invalid KEM public key size' });
+    }
+    // Handshake ID = sha256-ish: sorted addresses + timestamp
+    const id = Buffer.from(`${initiator}:${responder}:${Date.now()}`).toString('base64url').slice(0, 32);
+    latticeStmts.createHS.run(id, initiator, responder, kemPublicKey);
+    // Notify responder via SSE if they're connected
+    const responderClients = clients.get(responder) || [];
+    responderClients.forEach(c => c.write(`data: ${JSON.stringify({ type: 'lattice_handshake_request', handshakeId: id, from: initiator })}\n\n`));
+    console.log(`[Lattice] Handshake initiated: ${initiator.slice(0, 8)} → ${responder.slice(0, 8)} (id=${id})`);
+    res.json({ success: true, handshakeId: id });
+});
+
+// POST /api/lattice/handshake/:id/respond — responder posts ciphertext
+app.post('/api/lattice/handshake/:id/respond', (req, res) => {
+    const { responder, ciphertext } = req.body;
+    const { id } = req.params;
+    if (!responder || !ciphertext) {
+        return res.status(400).json({ error: 'Missing responder or ciphertext' });
+    }
+    const hs = latticeStmts.getHS.get(id);
+    if (!hs) return res.status(404).json({ error: 'Handshake not found' });
+    if (hs.responder !== responder) return res.status(403).json({ error: 'Not your handshake' });
+    if (hs.status !== 'initiated') return res.status(409).json({ error: `Handshake is '${hs.status}', not 'initiated'` });
+    // ML-KEM-768 ciphertext = 1088 bytes = 2176 hex chars
+    const ctBytes = Buffer.from(ciphertext, 'hex');
+    if (ctBytes.length !== 1088) {
+        return res.status(400).json({ error: `Invalid ciphertext size: expected 1088 bytes, got ${ctBytes.length}` });
+    }
+    latticeStmts.completeHS.run(ciphertext, id);
+    // Notify initiator via SSE
+    const initiatorClients = clients.get(hs.initiator) || [];
+    initiatorClients.forEach(c => c.write(`data: ${JSON.stringify({ type: 'lattice_handshake_completed', handshakeId: id, from: responder })}\n\n`));
+    console.log(`[Lattice] Handshake completed: ${responder.slice(0, 8)} responded to ${hs.initiator.slice(0, 8)} (id=${id})`);
+    res.json({ success: true });
+});
+
+// GET /api/lattice/handshake/:id — fetch handshake state (poll or after SSE notification)
+app.get('/api/lattice/handshake/:id', (req, res) => {
+    const hs = latticeStmts.getHS.get(req.params.id);
+    if (!hs) return res.status(404).json({ error: 'Not found' });
+    res.json({
+        id: hs.id,
+        initiator: hs.initiator,
+        responder: hs.responder,
+        kemPublicKey: hs.kem_public_key,
+        ciphertext: hs.ciphertext || null,
+        status: hs.status,
+        createdAt: hs.created_at,
+        updatedAt: hs.updated_at,
+    });
+});
+
+// POST /api/lattice/handshake/:id/acknowledge — initiator confirms shared secret established
+app.post('/api/lattice/handshake/:id/acknowledge', (req, res) => {
+    const { initiator } = req.body;
+    const { id } = req.params;
+    if (!initiator) return res.status(400).json({ error: 'Missing initiator' });
+    const hs = latticeStmts.getHS.get(id);
+    if (!hs) return res.status(404).json({ error: 'Handshake not found' });
+    if (hs.initiator !== initiator) return res.status(403).json({ error: 'Not your handshake' });
+    if (hs.status !== 'completed') return res.status(409).json({ error: `Handshake is '${hs.status}', not 'completed'` });
+    latticeStmts.acknowledgeHS.run(id);
+    // Notify responder that both parties are ready
+    const responderClients = clients.get(hs.responder) || [];
+    responderClients.forEach(c => c.write(`data: ${JSON.stringify({ type: 'lattice_handshake_acknowledged', handshakeId: id, from: initiator })}\n\n`));
+    console.log(`[Lattice] Handshake acknowledged: ${initiator.slice(0, 8)} ↔ ${hs.responder.slice(0, 8)} — secure channel established`);
+    res.json({ success: true });
+});
+
+// GET /api/lattice/pending/:address — pending handshake requests for a user
+app.get('/api/lattice/pending/:address', (req, res) => {
+    const rows = latticeStmts.getPending.all(req.params.address);
+    res.json(rows.map(hs => ({
+        id: hs.id,
+        initiator: hs.initiator,
+        kemPublicKey: hs.kem_public_key,
+        createdAt: hs.created_at,
+    })));
+});
+
+console.log('[Lattice] Post-quantum handshake relay loaded (ML-KEM-768)');
+
 
 // HTTP server
 app.listen(PORT, () => {

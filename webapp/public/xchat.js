@@ -582,7 +582,9 @@ function connectSSE() {
     // Use in-memory timestamp for incremental sync (within session only)
     // On page refresh, messages Map is empty so we need full sync (since=0)
     const hasLocalMessages = state.messages.size > 0;
-    const since = hasLocalMessages ? state.lastSyncTimestamp : 0;
+    // Subtract 10s buffer to catch messages that arrived during connection drop
+    // Duplicates are filtered by seenMessageIds
+    const since = hasLocalMessages ? Math.max(0, state.lastSyncTimestamp - 10000) : 0;
 
     const url = `${API_BASE}/api/stream/${encodeURIComponent(state.wallet)}?since=${since}`;
     console.log('[SSE] Connecting to:', url, 'since:', since, 'hasLocalMessages:', hasLocalMessages);
@@ -1194,16 +1196,18 @@ function renderMessages() {
             const msgId = el.dataset.msgId;
             const msgText = el.querySelector('.message-content')?.textContent?.trim() || '';
 
+            const isSent = el.classList.contains('sent');
+
             // Right-click
             el.addEventListener('contextmenu', (e) => {
                 e.preventDefault();
-                showCtxMenu(el, msgId, msgText);
+                showCtxMenu(el, msgId, msgText, isSent);
             });
 
             // Long-press for mobile
             let pressTimer;
             el.addEventListener('pointerdown', () => {
-                pressTimer = setTimeout(() => showCtxMenu(el, msgId, msgText), 500);
+                pressTimer = setTimeout(() => showCtxMenu(el, msgId, msgText, isSent), 500);
             });
             el.addEventListener('pointerup', () => clearTimeout(pressTimer));
             el.addEventListener('pointermove', () => clearTimeout(pressTimer));
@@ -1417,6 +1421,7 @@ const ctxMenu = {
     el: null,
     msgId: null,
     msgText: null,
+    isSent: false,
 };
 
 function initContextMenu() {
@@ -1441,11 +1446,20 @@ function initContextMenu() {
         hideCtxMenu();
     });
 
-    // Delete message
+    // Delete for me
     document.getElementById('ctxDelete').addEventListener('click', () => {
-        if (ctxMenu.msgId) deleteMessage(ctxMenu.msgId);
+        if (ctxMenu.msgId) deleteMessage(ctxMenu.msgId, false);
         hideCtxMenu();
     });
+
+    // Delete for both (sent messages only)
+    const deleteBothEl = document.getElementById('ctxDeleteBoth');
+    if (deleteBothEl) {
+        deleteBothEl.addEventListener('click', () => {
+            if (ctxMenu.msgId) deleteMessage(ctxMenu.msgId, true);
+            hideCtxMenu();
+        });
+    }
 
     // Click outside → close
     document.addEventListener('click', (e) => {
@@ -1453,10 +1467,15 @@ function initContextMenu() {
     });
 }
 
-function showCtxMenu(msgEl, msgId, msgText) {
+function showCtxMenu(msgEl, msgId, msgText, isSent) {
     if (!ctxMenu.el) return;
     ctxMenu.msgId = msgId;
     ctxMenu.msgText = msgText;
+    ctxMenu.isSent = !!isSent;
+
+    // Show "Delete for both" only on sent messages
+    const deleteBothEl = document.getElementById('ctxDeleteBoth');
+    if (deleteBothEl) deleteBothEl.style.display = isSent ? 'flex' : 'none';
 
     ctxMenu.el.style.display = 'block';
 
@@ -1570,12 +1589,11 @@ function saveDeletedId(msgId) {
     try { localStorage.setItem(key, JSON.stringify(arr)); } catch (e) {}
 }
 
-function deleteMessage(msgId) {
+function deleteMessage(msgId, forBoth = false) {
     if (!state.activeChat) return;
     const msgs = state.messages.get(state.activeChat);
     if (!msgs) return;
 
-    // Find the message — only sender can delete server-side
     const msg = msgs.find(m => m.id === msgId);
     const isSender = msg && msg.direction === 'sent';
 
@@ -1584,16 +1602,17 @@ function deleteMessage(msgId) {
     if (idx !== -1) msgs.splice(idx, 1);
     saveDeletedId(msgId);
     renderMessages();
-    showToast('Message deleted', 'success');
+    showToast(forBoth ? 'Message deleted for both' : 'Message deleted', 'success');
 
-    // If we sent it, also delete from server so the recipient can't see it
-    if (isSender && state.wallet) {
-        fetch('/api/messages/single/' + msgId, {
+    // Delete from server only if forBoth and we're the sender
+    if (forBoth && isSender && state.wallet) {
+        fetch(`${API_BASE}/api/messages/single/${msgId}`, {
             method: 'DELETE',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ senderAddress: state.wallet }),
+        }).then(res => {
+            if (!res.ok) res.json().then(d => console.warn('[Delete] Server error:', d.error));
         }).catch(e => console.warn('[Delete] Server delete failed:', e.message));
-        // SSE will push message_deleted to recipient — no further action needed here
     }
 }
 
@@ -2430,6 +2449,399 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 });
+
+
+
+// ============================================================================
+// LATTICE (ML-KEM-768) — POST-QUANTUM KEY EXCHANGE
+// ============================================================================
+// Wired into the existing xChat flow:
+//   1. On connect — generate ML-KEM keypair, register KEM public key with server
+//   2. On new chat — if peer has a KEM key, auto-initiate handshake
+//   3. SSE — handle incoming handshake_request / completed / acknowledged events
+//   4. On send — if lattice session active, encrypt with lattice key (AES-256-GCM)
+//   5. On receive — if LATTICE_MSG prefix, decrypt with lattice key
+// ============================================================================
+
+const LATTICE_MSG_PREFIX = 'LATTICE_MSG:';
+const LATTICE_FILE_PREFIX = 'LATTICE_FILE:';
+
+// Extend state with lattice fields
+Object.assign(state, {
+    kemPrivateKey:    null,   // Uint8Array — ML-KEM-768 secret key (stays in memory)
+    kemPublicKey:     null,   // Uint8Array — ML-KEM-768 public key (registered with server)
+    latticeSessions:  new Map(), // address → Uint8Array(32) shared secret
+    pendingHandshakes: new Map(), // handshakeId → { address, kemSecretKey }
+});
+
+// --------------------------------------------------------------------------
+// KEM Crypto helpers (pure JS, same @noble/post-quantum used in lattice.ts)
+// --------------------------------------------------------------------------
+
+async function loadMlKem() {
+    // Lazy-load @noble/post-quantum from CDN (or bundled)
+    if (window._mlKem768) return window._mlKem768;
+    // In the webapp we import it as a module script from the build
+    // Fall back to dynamic import if running unbundled
+    try {
+        const mod = await import('/node_modules/@noble/post-quantum/ml-kem.js');
+        window._mlKem768 = mod.ml_kem768;
+        return window._mlKem768;
+    } catch {
+        console.warn('[Lattice] @noble/post-quantum not available — falling back to X25519 only');
+        return null;
+    }
+}
+
+async function latticeGenerateKeypair() {
+    const mlKem = await loadMlKem();
+    if (!mlKem) return null;
+    return mlKem.keygen(); // { publicKey: Uint8Array(1184), secretKey: Uint8Array(2400) }
+}
+
+async function latticeEncapsulate(theirPublicKey) {
+    const mlKem = await loadMlKem();
+    if (!mlKem) return null;
+    return mlKem.encapsulate(theirPublicKey); // { cipherText: Uint8Array(1088), sharedSecret: Uint8Array(32) }
+}
+
+async function latticeDecapsulate(ciphertext, ourSecretKey) {
+    const mlKem = await loadMlKem();
+    if (!mlKem) return null;
+    return mlKem.decapsulate(ciphertext, ourSecretKey); // Uint8Array(32)
+}
+
+function bytesToHexStr(bytes) {
+    return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+function hexStrToBytes(hex) {
+    const arr = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < arr.length; i++) arr[i] = parseInt(hex.slice(i*2, i*2+2), 16);
+    return arr;
+}
+
+// AES-256-GCM via Web Crypto — for lattice-encrypted messages
+async function latticeEncrypt(sharedSecret, plaintext) {
+    const key = await crypto.subtle.importKey('raw', sharedSecret, { name: 'AES-GCM' }, false, ['encrypt']);
+    const nonce = crypto.getRandomValues(new Uint8Array(12));
+    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce }, key, plaintext);
+    return { nonce, ciphertext: new Uint8Array(ct) };
+}
+
+async function latticeDecrypt(sharedSecret, nonce, ciphertext) {
+    const key = await crypto.subtle.importKey('raw', sharedSecret, { name: 'AES-GCM' }, false, ['decrypt']);
+    return new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: nonce }, key, ciphertext));
+}
+
+// --------------------------------------------------------------------------
+// Register KEM public key on connect
+// --------------------------------------------------------------------------
+
+async function registerKemKey(walletAddress) {
+    const kp = await latticeGenerateKeypair();
+    if (!kp) return; // noble/pq not available
+
+    state.kemPrivateKey = kp.secretKey;
+    state.kemPublicKey  = kp.publicKey;
+    const kemPublicKeyHex = bytesToHexStr(kp.publicKey);
+
+    // Cache in localStorage so we survive page refresh (only pub key, never secret)
+    localStorage.setItem(`x1msg-kem-pub-${walletAddress}`, kemPublicKeyHex);
+
+    try {
+        await fetch(`${API_BASE}/api/lattice/keys`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ address: walletAddress, kemPublicKey: kemPublicKeyHex }),
+        });
+        console.log('[Lattice] KEM public key registered');
+    } catch (e) {
+        console.warn('[Lattice] KEM registration failed:', e.message);
+    }
+}
+
+// --------------------------------------------------------------------------
+// Initiate handshake with a new peer (called from startNewChat / selectChat)
+// --------------------------------------------------------------------------
+
+async function initiateLatticeHandshake(peerAddress) {
+    if (!state.kemPublicKey || !state.wallet) return;
+    if (state.latticeSessions.has(peerAddress)) return; // already have a session
+
+    // Check if peer has a KEM public key
+    try {
+        const res = await fetch(`${API_BASE}/api/lattice/keys/${encodeURIComponent(peerAddress)}`);
+        if (!res.ok) return; // peer not registered for lattice — use X25519 only
+    } catch { return; }
+
+    // Post initiation
+    try {
+        const res = await fetch(`${API_BASE}/api/lattice/handshake/initiate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                initiator:    state.wallet,
+                responder:    peerAddress,
+                kemPublicKey: bytesToHexStr(state.kemPublicKey),
+            }),
+        });
+        const { handshakeId } = await res.json();
+        state.pendingHandshakes.set(handshakeId, { address: peerAddress, kemSecretKey: state.kemPrivateKey });
+        console.log(`[Lattice] Handshake initiated with ${peerAddress.slice(0,8)} (id=${handshakeId})`);
+    } catch (e) {
+        console.warn('[Lattice] Initiate failed:', e.message);
+    }
+}
+
+// --------------------------------------------------------------------------
+// Respond to an incoming handshake request
+// --------------------------------------------------------------------------
+
+async function respondToLatticeHandshake(handshakeId, initiatorAddress, kemPublicKeyHex) {
+    if (!state.wallet) return;
+
+    try {
+        const theirPublicKey = hexStrToBytes(kemPublicKeyHex);
+        const result = await latticeEncapsulate(theirPublicKey);
+        if (!result) return;
+
+        const { cipherText, sharedSecret } = result;
+
+        // Post ciphertext to server
+        await fetch(`${API_BASE}/api/lattice/handshake/${handshakeId}/respond`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ responder: state.wallet, ciphertext: bytesToHexStr(cipherText) }),
+        });
+
+        // We now have our shared secret
+        state.latticeSessions.set(initiatorAddress, sharedSecret);
+        console.log(`[Lattice] ✅ Session established with ${initiatorAddress.slice(0,8)}`);
+        updateChatSecurityBadge(initiatorAddress);
+        showToast(`🔐 Quantum-safe session with ${initiatorAddress.slice(0,6)}...`, 'success');
+    } catch (e) {
+        console.warn('[Lattice] Respond failed:', e.message);
+    }
+}
+
+// --------------------------------------------------------------------------
+// Finalize: initiator fetches ciphertext and derives shared secret
+// --------------------------------------------------------------------------
+
+async function finalizeLatticeHandshake(handshakeId) {
+    const pending = state.pendingHandshakes.get(handshakeId);
+    if (!pending || !pending.kemSecretKey) return;
+
+    try {
+        const res = await fetch(`${API_BASE}/api/lattice/handshake/${handshakeId}`);
+        const hs = await res.json();
+        if (hs.status !== 'completed' || !hs.ciphertext) return;
+
+        const ciphertext    = hexStrToBytes(hs.ciphertext);
+        const sharedSecret  = await latticeDecapsulate(ciphertext, pending.kemSecretKey);
+        if (!sharedSecret) return;
+
+        state.latticeSessions.set(pending.address, sharedSecret);
+        state.pendingHandshakes.delete(handshakeId);
+
+        // Acknowledge on server
+        await fetch(`${API_BASE}/api/lattice/handshake/${handshakeId}/acknowledge`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ initiator: state.wallet }),
+        });
+
+        console.log(`[Lattice] ✅ Session finalized with ${pending.address.slice(0,8)}`);
+        updateChatSecurityBadge(pending.address);
+        showToast(`🔐 Quantum-safe session with ${pending.address.slice(0,6)}...`, 'success');
+    } catch (e) {
+        console.warn('[Lattice] Finalize failed:', e.message);
+    }
+}
+
+// --------------------------------------------------------------------------
+// Check for pending handshakes on reconnect
+// --------------------------------------------------------------------------
+
+async function checkPendingHandshakes() {
+    if (!state.wallet) return;
+    try {
+        const res = await fetch(`${API_BASE}/api/lattice/pending/${encodeURIComponent(state.wallet)}`);
+        const pending = await res.json();
+        for (const hs of pending) {
+            await respondToLatticeHandshake(hs.id, hs.initiator, hs.kemPublicKey);
+        }
+    } catch (e) {
+        console.warn('[Lattice] Pending check failed:', e.message);
+    }
+}
+
+// --------------------------------------------------------------------------
+// UI — security badge on chat header
+// --------------------------------------------------------------------------
+
+function updateChatSecurityBadge(address) {
+    if (state.activeChat !== address) return;
+    const chatStatus = document.getElementById('chatStatus');
+    if (!chatStatus) return;
+    if (state.latticeSessions.has(address)) {
+        chatStatus.innerHTML = '🔐 Post-quantum encrypted (ML-KEM-768)';
+        chatStatus.style.color = '#4ade80';
+    } else {
+        chatStatus.textContent = 'End-to-end encrypted';
+        chatStatus.style.color = '';
+    }
+}
+
+// --------------------------------------------------------------------------
+// Lattice-aware send: encrypt with lattice key if session exists
+// --------------------------------------------------------------------------
+
+const _originalSendMessage = window.sendMessage;
+window.sendMessage = async function() {
+    const input = document.getElementById('messageInput');
+    const content = input?.value?.trim();
+    if (!content || !state.activeChat) return;
+
+    const latticeSecret = state.latticeSessions.get(state.activeChat);
+    if (!latticeSecret) {
+        // No lattice session — use original X25519 path
+        return _originalSendMessage();
+    }
+
+    const contact = state.contacts.get(state.activeChat);
+    if (!contact) { showToast('Contact not found', 'error'); return; }
+
+    try {
+        const plaintext = new TextEncoder().encode(content);
+        const { nonce, ciphertext } = await latticeEncrypt(latticeSecret, plaintext);
+
+        // Wire format: LATTICE_MSG:<nonce_hex>:<ciphertext_hex>
+        const payload = LATTICE_MSG_PREFIX + bytesToHexStr(nonce) + ':' + bytesToHexStr(ciphertext);
+
+        // Re-encrypt the lattice payload with X25519 so the server sees only opaque bytes
+        // (dual-layer: quantum-resistant inner, X25519 outer for transport)
+        const outerBytes = new TextEncoder().encode(payload);
+        const { nonce: outerNonce, ciphertext: outerCt } = encrypt(contact.sessionKey, outerBytes);
+
+        const messageId = await sendMessageToServer(
+            state.wallet, state.activeChat,
+            base58Encode(outerNonce), base58Encode(outerCt)
+        );
+        if (!messageId) { showToast('Failed to send', 'error'); return; }
+
+        const message = {
+            id: messageId, from: state.wallet, to: state.activeChat,
+            content, timestamp: Date.now(), direction: 'sent',
+        };
+        addMessageToChat(state.activeChat, message);
+        contact.lastMessage = message;
+        input.value = '';
+        input.style.height = 'auto';
+        updateContactsList();
+        renderMessages();
+    } catch (e) {
+        console.error('[Lattice] Send failed:', e);
+        showToast('Send failed', 'error');
+    }
+};
+
+// --------------------------------------------------------------------------
+// Lattice-aware receive: detect and unwrap LATTICE_MSG prefix
+// --------------------------------------------------------------------------
+
+const _originalProcessIncoming = processIncomingMessage;
+window._latticeProcessIncoming = async function(msg) {
+    const result = await _originalProcessIncoming(msg);
+    if (!result) return result;
+
+    if (!result.content.startsWith(LATTICE_MSG_PREFIX)) return result;
+
+    // Inner content is lattice-encrypted — unwrap
+    const latticeSecret = state.latticeSessions.get(result.contactAddress);
+    if (!latticeSecret) {
+        result.content = '[Encrypted — no lattice session yet]';
+        return result;
+    }
+
+    try {
+        const inner = result.content.slice(LATTICE_MSG_PREFIX.length);
+        const [nonceHex, ctHex] = inner.split(':');
+        const plaintext = await latticeDecrypt(latticeSecret, hexStrToBytes(nonceHex), hexStrToBytes(ctHex));
+        result.content = new TextDecoder().decode(plaintext);
+    } catch (e) {
+        result.content = '[Lattice decrypt failed]';
+    }
+    return result;
+};
+
+// --------------------------------------------------------------------------
+// SSE: handle lattice handshake events
+// --------------------------------------------------------------------------
+
+const _handleLatticeSSEEvent = async (data) => {
+    if (data.type === 'lattice_handshake_request') {
+        // Someone wants to establish a quantum-safe session with us
+        const hs = await fetch(`${API_BASE}/api/lattice/handshake/${data.handshakeId}`)
+            .then(r => r.json()).catch(() => null);
+        if (hs) await respondToLatticeHandshake(data.handshakeId, hs.initiator, hs.kemPublicKey);
+
+    } else if (data.type === 'lattice_handshake_completed') {
+        // Our handshake was responded to — finalize
+        await finalizeLatticeHandshake(data.handshakeId);
+
+    } else if (data.type === 'lattice_handshake_acknowledged') {
+        // Both sides confirmed — update badge if in this chat
+        const pending = state.pendingHandshakes.get(data.handshakeId);
+        if (pending) updateChatSecurityBadge(pending.address);
+    }
+};
+
+// Patch connectSSE's eventSource.onmessage to route lattice events
+const _originalConnectSSE = connectSSE;
+window.connectSSE = connectSSE = function() {
+    _originalConnectSSE();
+    if (!state.sseConnection) return;
+    const origOnMessage = state.sseConnection.onmessage;
+    state.sseConnection.onmessage = async (event) => {
+        const data = JSON.parse(event.data);
+        if (data.type?.startsWith('lattice_')) {
+            await _handleLatticeSSEEvent(data);
+        } else {
+            await origOnMessage(event);
+        }
+    };
+};
+
+// --------------------------------------------------------------------------
+// Patch selectChat to trigger handshake when opening a conversation
+// --------------------------------------------------------------------------
+
+const _originalSelectChat = window.selectChat;
+window.selectChat = async function(address) {
+    _originalSelectChat(address);
+    updateChatSecurityBadge(address);
+    // Kick off handshake in background if we don't have a session yet
+    if (!state.latticeSessions.has(address)) {
+        initiateLatticeHandshake(address).catch(() => {});
+    }
+};
+
+// --------------------------------------------------------------------------
+// Patch connectWallet to register KEM key and check pending handshakes
+// --------------------------------------------------------------------------
+
+const _originalConnectWallet = window.connectWallet;
+window.connectWallet = async function() {
+    await _originalConnectWallet();
+    if (state.wallet) {
+        await registerKemKey(state.wallet);
+        await checkPendingHandshakes();
+    }
+};
+
+console.log('[Lattice] ML-KEM-768 post-quantum layer loaded');
+
 
 // Debug
 window.chatState = state;
